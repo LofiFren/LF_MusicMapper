@@ -1,0 +1,13 @@
+Nuitka==2.6.9
+numpy==2.2.4
+ordered-set==4.1.0
+PyAudio==0.2.14
+PyQt5==5.15.11
+PyQt5-Qt5==5.15.16
+PyQt5_sip==12.17.0
+PySide6==6.9.0
+PySide6_Addons==6.9.0
+PySide6_Essentials==6.9.0
+scipy==1.15.2
+shiboken6==6.9.0
+zstandard==0.23.0
