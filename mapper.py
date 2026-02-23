@@ -10,6 +10,7 @@ import time
 from threading import Thread
 from collections import deque
 from scipy.fft import fft  # For spectrum analysis
+from themes import THEMES, generate_qss, build_spectrogram_lut
 
 # macOS-only: programmatic CoreAudio aggregate device creation for split
 # USB devices (e.g. S-4 enumerated as separate input/output entries).
@@ -570,12 +571,15 @@ class AudioManager:
                                 if isinstance(idx, int) and 0 <= idx < self.total_input_channels:
                                     valid_entries.append({'index': idx, 'gain': max(0.0, float(gain))})
 
-                            total_gain = sum(item['gain'] for item in valid_entries)
-                            if total_gain > 0:
+                            if valid_entries:
                                 mixed = np.zeros(frame_count, dtype=np.float32)
                                 for item in valid_entries:
                                     mixed += combined[:, item['index']] * item['gain']
-                                mixed /= total_gain
+                                # Normalize by source count (not total gain) to
+                                # prevent clipping when mixing multiple inputs
+                                # while preserving per-source volume control.
+                                if len(valid_entries) > 1:
+                                    mixed /= len(valid_entries)
                                 output_frames[:, out_ch] = mixed
 
                         # Soft-clip output to prevent popping from hot signals
@@ -1047,12 +1051,18 @@ class TrackMapperWidget(QtWidgets.QWidget):
         self.input_channel_count = 2
         self.input_labels = ["A1", "A2"]
         self.current_input_infos = [{'label': 'A', 'channels': 2}]
+        self._track_colors = THEMES['Dark']['palette']['track_colors']
+        self._track_label_widgets = []
+        self._header_labels = [track_header, left_header, right_header, assign_header]
+        self._title_widget = title
+        self._helper_widget = helper
 
         # Create 4 rows for 4 tracks
         for i in range(4):  # 4 tracks
             # Track number with custom styling
             track_label = QtWidgets.QLabel(f"Track {i+1}")
             track_label.setStyleSheet(f"font-weight: bold; color: {self.get_track_color(i)};")
+            self._track_label_widgets.append(track_label)
             grid.addWidget(track_label, i+1, 0)
 
             # Left channel (X.1)
@@ -1141,14 +1151,13 @@ class TrackMapperWidget(QtWidgets.QWidget):
         layout.addWidget(self.status_label)
 
     def get_track_color(self, track_idx):
-        """Get color for a specific track"""
-        colors = [
-            "#4B9DE0",  # Track 1 - Blue
-            "#50C878",  # Track 2 - Green
-            "#E6A23C",  # Track 3 - Orange
-            "#E77F7F"   # Track 4 - Red
-        ]
-        return colors[track_idx % len(colors)]
+        """Get color for a specific track from theme track_colors."""
+        return self._track_colors[track_idx % len(self._track_colors)]
+
+    def _refresh_track_colors(self):
+        """Re-apply track colors after a theme change."""
+        for i, lbl in enumerate(self._track_label_widgets):
+            lbl.setStyleSheet(f"font-weight: bold; color: {self.get_track_color(i)};")
 
     def _rebuild_quick_buttons(self):
         """Rebuild quick-set buttons for each track based on current input devices."""
@@ -1407,6 +1416,7 @@ class SpectrogramWaterfall3D(QtWidgets.QWidget):
         for i, c in enumerate(self.color_lut):
             self._color_lut_np[i] = [c.red(), c.green(), c.blue(), 255]
         self._img_buffer = None  # prevent GC of QImage backing memory
+        self._bg_color = QtGui.QColor(8, 8, 15)  # spectrogram background
 
         # Perspective parameters
         self.vanish_x = 0.5    # vanishing point X (fraction of width)
@@ -1477,6 +1487,20 @@ class SpectrogramWaterfall3D(QtWidgets.QWidget):
         idx = int(max(0.0, min(1.0, amp)) * (self.COLOR_STEPS - 1))
         return self.color_lut[idx]
 
+    def set_color_lut(self, lut, bg_rgb=None):
+        """Replace the color LUT (e.g. when switching themes).
+
+        Args:
+            lut: list[QColor] of length COLOR_STEPS.
+            bg_rgb: optional (r,g,b) tuple for the spectrogram background.
+        """
+        self.color_lut = lut
+        self._color_lut_np = np.zeros((len(lut), 4), dtype=np.uint8)
+        for i, c in enumerate(lut):
+            self._color_lut_np[i] = [c.red(), c.green(), c.blue(), 255]
+        if bg_rgb is not None:
+            self._bg_color = QtGui.QColor(*bg_rgb)
+
     def update_audio_data(self, left_data, right_data):
         """Perform FFT on incoming audio and push a new row into history."""
         # Mix to mono for the spectrogram
@@ -1543,7 +1567,7 @@ class SpectrogramWaterfall3D(QtWidgets.QWidget):
         # --- Step 2: Render perspective strips + 3D height ridges ---
         pixmap = QtGui.QPixmap(w, h)
         painter = QtGui.QPainter(pixmap)
-        painter.fillRect(0, 0, w, h, QtGui.QColor(8, 8, 15))
+        painter.fillRect(0, 0, w, h, self._bg_color)
         painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
 
         vx = w * self.vanish_x
@@ -1652,6 +1676,13 @@ class EnhancedMultiLevelMeter(QtWidgets.QWidget):
         self.clip_duration = 60  # Frames to show clip indicator (1 second at 60fps)
         self.num_channels = channels
         self.tick_levels = [0, -3, -6, -12, -24, -40, -60]
+
+        # Theme-driven meter colors (defaults match Dark theme)
+        dark = THEMES['Dark']
+        self.meter_zones = dark['meter_zones']
+        self.meter_peak_zones = dark['meter_peak_zones']
+        self._meter_bg = QtGui.QColor(28, 28, 30)
+        self._meter_outer_bg = QtGui.QColor(35, 35, 37)
         
         # Animation timer
         self.animation_timer = QtCore.QTimer(self)
@@ -1668,7 +1699,23 @@ class EnhancedMultiLevelMeter(QtWidgets.QWidget):
         self.num_channels = min(num_channels, 8)  # Limit to 8 channels max
         self.setMinimumSize(20 * self.num_channels, 200)
         self.update()
-        
+
+    def set_meter_zones(self, zones, peak_zones, palette):
+        """Update meter colors from a theme.
+
+        Args:
+            zones: list of (threshold, (top_r,g,b), (bottom_r,g,b))
+            peak_zones: list of (threshold, (r,g,b))
+            palette: theme palette dict (for meter_bg)
+        """
+        self.meter_zones = zones
+        self.meter_peak_zones = peak_zones
+        bg = palette.get('meter_bg', '#1C1C1E')
+        r, g, b = int(bg[1:3], 16), int(bg[3:5], 16), int(bg[5:7], 16)
+        self._meter_bg = QtGui.QColor(r + 6, g + 6, b + 8)
+        self._meter_outer_bg = QtGui.QColor(r + 13, g + 13, b + 15)
+        self.update()
+
     def set_levels(self, levels):
         """Set the target levels for all channels (0.0 to 1.0)"""
         for i in range(min(len(levels), self.num_channels)):
@@ -1729,8 +1776,8 @@ class EnhancedMultiLevelMeter(QtWidgets.QWidget):
         meter_width = width // self.num_channels if self.num_channels > 0 else width
         
         # Draw background for all meters
-        painter.fillRect(0, 0, width, height, QtGui.QColor(35, 35, 37))
-        
+        painter.fillRect(0, 0, width, height, self._meter_outer_bg)
+
         # Draw each channel meter
         for ch in range(self.num_channels):
             level = self.levels[ch]
@@ -1738,74 +1785,58 @@ class EnhancedMultiLevelMeter(QtWidgets.QWidget):
             level_height = int(height * level)
             peak_height = int(height * peak_level)
             x = ch * meter_width
-            
+
             # Draw meter gradient background
             painter.fillRect(
-                x, 0, meter_width - 1, height, 
-                QtGui.QColor(28, 28, 30)
+                x, 0, meter_width - 1, height,
+                self._meter_bg
             )
-            
+
             # Track/channel identifier at bottom
             track_num = ch // 2 + 1
             ch_num = ch % 2 + 1
-            
-            # Draw rounded meter with improved gradient
+
+            # Draw rounded meter with zone-driven gradient
             if level_height > 0:
-                # Create gradient for smoother transitions between colors
                 gradient = QtGui.QLinearGradient(
-                    x, height - level_height, 
+                    x, height - level_height,
                     x, height
                 )
-                
-                # Choose colors based on level with better gradations
-                if level < 0.4:  # Safe zone (green)
-                    gradient.setColorAt(0, QtGui.QColor(50, 205, 50))  # Green
-                    gradient.setColorAt(1, QtGui.QColor(30, 160, 30))
-                elif level < 0.7:  # Caution zone (yellow-green to yellow)
-                    gradient.setColorAt(0, QtGui.QColor(180, 210, 40))  # Yellow-green
-                    gradient.setColorAt(1, QtGui.QColor(170, 170, 20))
-                elif level < 0.85:  # Warning zone (yellow to orange)
-                    gradient.setColorAt(0, QtGui.QColor(255, 215, 0))  # Yellow
-                    gradient.setColorAt(1, QtGui.QColor(240, 170, 0))
-                elif level < 0.95:  # Danger zone (orange to red)
-                    gradient.setColorAt(0, QtGui.QColor(255, 140, 0))  # Orange
-                    gradient.setColorAt(1, QtGui.QColor(220, 80, 0))
-                else:  # Clipping zone (bright red)
-                    gradient.setColorAt(0, QtGui.QColor(255, 30, 30))  # Bright red
-                    gradient.setColorAt(1, QtGui.QColor(180, 0, 0))
-                    
+
+                # Pick colors from self.meter_zones
+                top_rgb = self.meter_zones[-1][1]
+                bot_rgb = self.meter_zones[-1][2]
+                for threshold, t_rgb, b_rgb in self.meter_zones:
+                    if level < threshold:
+                        top_rgb, bot_rgb = t_rgb, b_rgb
+                        break
+                gradient.setColorAt(0, QtGui.QColor(*top_rgb))
+                gradient.setColorAt(1, QtGui.QColor(*bot_rgb))
+
                 # Fill rounded meter
                 meter_rect = QtCore.QRectF(
-                    x + 1, height - level_height, 
+                    x + 1, height - level_height,
                     meter_width - 2, level_height
                 )
                 painter.setBrush(gradient)
                 painter.setPen(QtCore.Qt.NoPen)
                 painter.drawRoundedRect(meter_rect, 2, 2)
-            
-            # Draw peak indicator with enhanced style
+
+            # Draw peak indicator with zone-driven colors
             if peak_height > 0:
-                # Create gradient for peak indicator
-                peak_color = QtGui.QColor(255, 255, 255)  # White base
-                
-                if peak_level < 0.4:
-                    peak_color = QtGui.QColor(120, 255, 120)  # Light green
-                elif peak_level < 0.7:
-                    peak_color = QtGui.QColor(230, 230, 100)  # Light yellow
-                elif peak_level < 0.85:
-                    peak_color = QtGui.QColor(255, 200, 0)  # Gold
-                elif peak_level < 0.95:
-                    peak_color = QtGui.QColor(255, 140, 0)  # Orange
-                else:
-                    # Animate clip indicator by alternating colors
-                    if self.clip_indicators[ch] > 0:
-                        frame = self.clip_indicators[ch]
-                        if frame % 10 < 5:  # Blink effect
-                            peak_color = QtGui.QColor(255, 50, 50)  # Red
-                        else:
-                            peak_color = QtGui.QColor(255, 220, 220)  # Light red
-                    else:
-                        peak_color = QtGui.QColor(255, 50, 50)  # Red
+                peak_rgb = self.meter_peak_zones[-1][1]
+                for threshold, p_rgb in self.meter_peak_zones:
+                    if peak_level < threshold:
+                        peak_rgb = p_rgb
+                        break
+
+                # Clip blink override
+                if peak_level >= 0.95 and self.clip_indicators[ch] > 0:
+                    frame = self.clip_indicators[ch]
+                    if frame % 10 >= 5:
+                        peak_rgb = (min(255, peak_rgb[0]), min(255, peak_rgb[1] + 170), min(255, peak_rgb[2] + 170))
+
+                peak_color = QtGui.QColor(*peak_rgb)
                 
                 peak_rect = QtCore.QRectF(
                     x + 1, height - peak_height - 2, 
@@ -1881,11 +1912,726 @@ class EnhancedMultiLevelMeter(QtWidgets.QWidget):
                 painter.drawText(clip_rect, QtCore.Qt.AlignCenter, "CLIP")
 
 
+class PatchbayView(QtWidgets.QWidget):
+    """Visual patchbay matrix: inputs on rows, output channels on columns.
+
+    Click intersections to patch. Scroll wheel to adjust gain.
+    Fully custom-painted for a polished, professional look.
+    """
+
+    mapping_changed = Signal()
+
+    # Minimum layout constants (used when space allows; shrink for many inputs)
+    HEADER_WIDTH_MIN = 48
+    HEADER_HEIGHT_MIN = 36
+    ROW_HEIGHT_MIN = 18
+    ROW_HEIGHT_MAX = 30
+    COL_WIDTH_MIN = 30
+    COL_WIDTH_MAX = 42
+    NUM_OUTPUTS = 8  # 4 tracks x 2 channels
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMouseTracking(True)
+        self.setMinimumSize(400, 150)
+        self.setFocusPolicy(QtCore.Qt.WheelFocus)
+
+        self._track_colors = THEMES['Dark']['palette']['track_colors']
+        self.input_infos = [{'label': 'A', 'channels': 2}]
+        self.input_labels = ['A1', 'A2']
+        self.input_channel_count = 2
+
+        # Connections: (input_idx, output_ch) -> gain float 0.0-1.0
+        self._connections = {}
+
+        # Hover state
+        self._hover_row = -1
+        self._hover_col = -1
+
+        # Status label (API compat with other views)
+        self.status_label = QtWidgets.QLabel("")
+
+        # Build layout: matrix + preset buttons + status
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(6)
+        layout.setContentsMargins(4, 4, 4, 4)
+
+        # The matrix is drawn in paintEvent, we just need the widget area
+        self._matrix_widget = _PatchbayMatrix(self)
+        layout.addWidget(self._matrix_widget, stretch=1)
+
+        # Preset buttons
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.setSpacing(8)
+
+        for label, slot in [
+            ("Clear All", self._preset_clear),
+            ("Auto Stereo", self._preset_auto_stereo),
+            ("Mono All", self._preset_mono_all),
+        ]:
+            btn = QtWidgets.QPushButton(label)
+            btn.setProperty("preset", True)
+            btn.clicked.connect(slot)
+            btn_row.addWidget(btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+        layout.addWidget(self.status_label)
+
+    def _metrics(self, widget_w, widget_h):
+        """Compute dynamic layout metrics that scale to fit all inputs.
+
+        Returns dict with: HW, HH, RH, CW, node_max_r, node_min_r
+        """
+        n_inputs = max(1, self.input_channel_count)
+        n_outputs = self.NUM_OUTPUTS
+
+        # Header sizes — scale down for tight layouts
+        HW = max(self.HEADER_WIDTH_MIN, min(56, int(widget_w * 0.1)))
+        HH = max(self.HEADER_HEIGHT_MIN, min(44, int(widget_h * 0.08)))
+
+        # Available area for the grid
+        avail_h = widget_h - HH - 4
+        avail_w = widget_w - HW - 4
+
+        # Row height: fit all inputs, clamped to min/max
+        RH = max(self.ROW_HEIGHT_MIN, min(self.ROW_HEIGHT_MAX, avail_h // n_inputs))
+        # Column width: fit 8 outputs, clamped to min/max
+        CW = max(self.COL_WIDTH_MIN, min(self.COL_WIDTH_MAX, avail_w // n_outputs))
+
+        # Node radius scales with cell size
+        cell_min = min(RH, CW)
+        node_max_r = max(4, int(cell_min * 0.38))
+        node_min_r = max(2, int(node_max_r * 0.4))
+
+        return {
+            'HW': HW, 'HH': HH, 'RH': RH, 'CW': CW,
+            'node_max_r': node_max_r, 'node_min_r': node_min_r,
+        }
+
+    # -- Input management --------------------------------------------------
+
+    def update_for_inputs(self, input_infos):
+        self.input_infos = input_infos
+        labels = []
+        for info in input_infos:
+            for ch in range(info['channels']):
+                labels.append(f"{info['label']}{ch + 1}")
+        self.input_channel_count = len(labels)
+        self.input_labels = labels
+        # Prune connections that reference removed inputs
+        to_remove = [k for k in self._connections if k[0] >= self.input_channel_count]
+        for k in to_remove:
+            del self._connections[k]
+        self._matrix_widget.update()
+
+    # -- Mapping API (same format as MixerStripView / TrackMapperWidget) ---
+
+    def get_mapping(self):
+        mapping = []
+        for out_ch in range(8):
+            sources = []
+            for (inp, och), gain in self._connections.items():
+                if och == out_ch and gain > 0:
+                    sources.append({'index': inp, 'gain': round(gain, 3)})
+            mapping.append(sources)
+        return mapping
+
+    def set_mapping(self, mapping):
+        self._connections.clear()
+        for out_ch, sources in enumerate(mapping):
+            if not isinstance(sources, list):
+                continue
+            for src in sources:
+                if isinstance(src, dict):
+                    idx = src.get('index')
+                    gain = src.get('gain', 1.0)
+                    if isinstance(idx, int) and idx >= 0 and gain > 0:
+                        self._connections[(idx, out_ch)] = gain
+        self._matrix_widget.update()
+
+    # -- Presets -----------------------------------------------------------
+
+    def _preset_clear(self):
+        self._connections.clear()
+        self._matrix_widget.update()
+        self.mapping_changed.emit()
+        self.status_label.setText("Cleared all connections")
+
+    def _preset_auto_stereo(self):
+        self._connections.clear()
+        ch_offset = 0
+        out_ch = 0
+        for info in self.input_infos:
+            pairs = info['channels'] // 2
+            for p in range(pairs):
+                if out_ch + 1 < 8:
+                    self._connections[(ch_offset + p * 2, out_ch)] = 1.0
+                    self._connections[(ch_offset + p * 2 + 1, out_ch + 1)] = 1.0
+                    out_ch += 2
+            ch_offset += info['channels']
+        self._matrix_widget.update()
+        self.mapping_changed.emit()
+        self.status_label.setText("Auto stereo routing applied")
+
+    def _preset_mono_all(self):
+        self._connections.clear()
+        ch_offset = 0
+        out_ch = 0
+        for info in self.input_infos:
+            for ch in range(info['channels']):
+                if out_ch < 8:
+                    self._connections[(ch_offset + ch, out_ch)] = 1.0
+                    out_ch += 1
+            ch_offset += info['channels']
+        self._matrix_widget.update()
+        self.mapping_changed.emit()
+        self.status_label.setText("Mono routing applied")
+
+    def auto_assign_devices(self, input_infos, num_output_tracks=4):
+        """Auto-assign each device to its own track (same logic as TrackMapperWidget)."""
+        self._connections.clear()
+        num_tracks = min(4, max(1, num_output_tracks))
+        ch_offset = 0
+        for dev_idx, info in enumerate(input_infos):
+            track_idx = dev_idx % num_tracks
+            out_l = track_idx * 2
+            out_r = track_idx * 2 + 1
+            self._connections[(ch_offset, out_l)] = 1.0
+            if info['channels'] >= 2:
+                self._connections[(ch_offset + 1, out_r)] = 1.0
+            else:
+                self._connections[(ch_offset, out_r)] = 1.0
+            ch_offset += info['channels']
+        self._matrix_widget.update()
+        self.mapping_changed.emit()
+
+    # -- Theme support -----------------------------------------------------
+
+    def get_track_color(self, track_idx):
+        return self._track_colors[track_idx % len(self._track_colors)]
+
+    def _refresh_track_colors(self):
+        self._matrix_widget.update()
+
+    def _device_color_for_input(self, input_idx):
+        """Get the device color for a given global input index."""
+        offset = 0
+        for i, info in enumerate(self.input_infos):
+            if input_idx < offset + info['channels']:
+                return self._track_colors[i % len(self._track_colors)]
+            offset += info['channels']
+        return self._track_colors[0]
+
+    def _device_index_for_input(self, input_idx):
+        """Get which device (0, 1, 2) owns a global input index."""
+        offset = 0
+        for i, info in enumerate(self.input_infos):
+            if input_idx < offset + info['channels']:
+                return i
+            offset += info['channels']
+        return 0
+
+
+class _PatchbayMatrix(QtWidgets.QWidget):
+    """Inner widget that handles painting and mouse interaction for PatchbayView."""
+
+    def __init__(self, patchbay):
+        super().__init__(patchbay)
+        self.pb = patchbay
+        self.setMouseTracking(True)
+        self.setMinimumSize(300, 100)
+        self._hover_row = -1
+        self._hover_col = -1
+        self._gain_popup = None
+
+    def _m(self):
+        """Get current dynamic metrics."""
+        return self.pb._metrics(self.width(), self.height())
+
+    def _hit_test(self, pos):
+        """Return (row, col) for a mouse position, or (-1,-1) if outside grid."""
+        m = self._m()
+        x = pos.x() - m['HW']
+        y = pos.y() - m['HH']
+        if x < 0 or y < 0:
+            return -1, -1
+        col = int(x / m['CW'])
+        row = int(y / m['RH'])
+        if row >= self.pb.input_channel_count or col >= self.pb.NUM_OUTPUTS:
+            return -1, -1
+        return row, col
+
+    # -- Mouse events ------------------------------------------------------
+
+    def mouseMoveEvent(self, event):
+        row, col = self._hit_test(event.pos())
+        if row != self._hover_row or col != self._hover_col:
+            self._hover_row = row
+            self._hover_col = col
+            self.update()
+
+    def leaveEvent(self, event):
+        self._hover_row = -1
+        self._hover_col = -1
+        self.update()
+
+    def mousePressEvent(self, event):
+        row, col = self._hit_test(event.pos())
+        if row < 0 or col < 0:
+            return
+
+        key = (row, col)
+        if event.button() == QtCore.Qt.LeftButton:
+            if key in self.pb._connections:
+                del self.pb._connections[key]
+            else:
+                self.pb._connections[key] = 1.0
+            self.update()
+            self.pb.mapping_changed.emit()
+        elif event.button() == QtCore.Qt.RightButton:
+            if key in self.pb._connections:
+                self._show_gain_popup(key, event.globalPos())
+
+    def wheelEvent(self, event):
+        pos = event.position().toPoint() if hasattr(event.position(), 'toPoint') else event.pos()
+        row, col = self._hit_test(pos)
+        if row < 0 or col < 0:
+            return
+        key = (row, col)
+        if key not in self.pb._connections:
+            return
+        delta = event.angleDelta().y()
+        step = 0.05 if delta > 0 else -0.05
+        new_gain = max(0.05, min(1.0, self.pb._connections[key] + step))
+        self.pb._connections[key] = round(new_gain, 2)
+        self.update()
+        self.pb.mapping_changed.emit()
+
+    def _show_gain_popup(self, key, global_pos):
+        """Show a small popup with a gain slider for the given connection."""
+        if self._gain_popup:
+            self._gain_popup.close()
+        popup = QtWidgets.QWidget(self, QtCore.Qt.Popup)
+        popup.setFixedSize(160, 50)
+        lay = QtWidgets.QHBoxLayout(popup)
+        lay.setContentsMargins(8, 4, 8, 4)
+        lbl = QtWidgets.QLabel(f"{int(self.pb._connections[key] * 100)}%")
+        lbl.setFixedWidth(36)
+        slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        slider.setRange(5, 100)
+        slider.setValue(int(self.pb._connections[key] * 100))
+
+        def on_change(val):
+            self.pb._connections[key] = val / 100.0
+            lbl.setText(f"{val}%")
+            self.update()
+            self.pb.mapping_changed.emit()
+
+        slider.valueChanged.connect(on_change)
+        lay.addWidget(slider)
+        lay.addWidget(lbl)
+        popup.move(global_pos)
+        popup.show()
+        self._gain_popup = popup
+
+    # -- Painting ----------------------------------------------------------
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+
+        w = self.width()
+        h = self.height()
+        num_inputs = self.pb.input_channel_count
+        num_outputs = self.pb.NUM_OUTPUTS
+
+        m = self.pb._metrics(w, h)
+        HW, HH, RH, CW = m['HW'], m['HH'], m['RH'], m['CW']
+        node_max_r = m['node_max_r']
+        node_min_r = m['node_min_r']
+
+        # Adaptive font sizes based on cell height
+        font_large = max(7, min(9, RH // 3))
+        font_small = max(6, font_large - 1)
+        font_tiny = max(5, font_large - 2)
+
+        # Get theme colors
+        mw = self.window()
+        theme_name = getattr(mw, '_current_theme', 'Dark')
+        theme = THEMES.get(theme_name, THEMES['Dark'])
+        pal = theme['palette']
+
+        bg = QtGui.QColor(pal['bg_secondary'])
+        bg_alt = QtGui.QColor(pal['bg_tertiary'])
+        border_color = QtGui.QColor(pal['border'])
+        text_dim = QtGui.QColor(pal['text_dim'])
+
+        # 1. Fill background
+        painter.fillRect(0, 0, w, h, bg)
+
+        # 2. Alternating track-pair column bands
+        for track in range(4):
+            x = HW + track * 2 * CW
+            band_color = bg_alt if track % 2 == 0 else bg
+            painter.fillRect(
+                QtCore.QRectF(x, HH, CW * 2, num_inputs * RH),
+                band_color
+            )
+
+        # 3. Crosshair highlight for hovered cell
+        if self._hover_row >= 0 and self._hover_col >= 0:
+            cross_color = QtGui.QColor(pal['accent'])
+            cross_color.setAlpha(25)
+            painter.fillRect(
+                QtCore.QRectF(HW, HH + self._hover_row * RH, num_outputs * CW, RH),
+                cross_color
+            )
+            painter.fillRect(
+                QtCore.QRectF(HW + self._hover_col * CW, HH, CW, num_inputs * RH),
+                cross_color
+            )
+
+        # 4. Grid lines
+        grid_pen = QtGui.QPen(border_color, 0.5)
+        painter.setPen(grid_pen)
+        for row in range(num_inputs + 1):
+            y = HH + row * RH
+            painter.drawLine(QtCore.QPointF(HW, y), QtCore.QPointF(HW + num_outputs * CW, y))
+        for col in range(num_outputs + 1):
+            x = HW + col * CW
+            painter.drawLine(QtCore.QPointF(x, HH), QtCore.QPointF(x, HH + num_inputs * RH))
+
+        # 5. Device separator lines (thicker)
+        sep_pen = QtGui.QPen(border_color, 2.0)
+        offset = 0
+        for info in self.pb.input_infos:
+            if offset > 0:
+                y = HH + offset * RH
+                painter.setPen(sep_pen)
+                painter.drawLine(QtCore.QPointF(0, y), QtCore.QPointF(HW + num_outputs * CW, y))
+            offset += info['channels']
+
+        # 6. Track pair separator lines (thicker vertical)
+        for track in range(1, 4):
+            x = HW + track * 2 * CW
+            painter.setPen(sep_pen)
+            painter.drawLine(QtCore.QPointF(x, 0), QtCore.QPointF(x, HH + num_inputs * RH))
+
+        # 7. Column headers — Track name + L/R
+        painter.setFont(QtGui.QFont("Arial", font_large, QtGui.QFont.Bold))
+        for track in range(4):
+            tc = QtGui.QColor(self.pb.get_track_color(track))
+            x = HW + track * 2 * CW
+            painter.setPen(tc)
+            track_rect = QtCore.QRectF(x, 1, CW * 2, HH * 0.55)
+            painter.drawText(track_rect, QtCore.Qt.AlignCenter, f"Track {track + 1}")
+            painter.setFont(QtGui.QFont("Arial", font_small))
+            painter.setPen(text_dim)
+            l_rect = QtCore.QRectF(x, HH * 0.5, CW, HH * 0.5)
+            r_rect = QtCore.QRectF(x + CW, HH * 0.5, CW, HH * 0.5)
+            painter.drawText(l_rect, QtCore.Qt.AlignCenter, "L")
+            painter.drawText(r_rect, QtCore.Qt.AlignCenter, "R")
+            painter.setFont(QtGui.QFont("Arial", font_large, QtGui.QFont.Bold))
+
+        # 8. Row headers — input channel labels
+        painter.setFont(QtGui.QFont("Arial", font_large, QtGui.QFont.Bold))
+        for row in range(num_inputs):
+            label = self.pb.input_labels[row] if row < len(self.pb.input_labels) else f"?{row}"
+            color = QtGui.QColor(self.pb._device_color_for_input(row))
+            painter.setPen(color)
+            rect = QtCore.QRectF(2, HH + row * RH, HW - 4, RH)
+            painter.drawText(rect, QtCore.Qt.AlignVCenter | QtCore.Qt.AlignRight, label)
+
+        # 9. Connection nodes
+        for row in range(num_inputs):
+            for col in range(num_outputs):
+                key = (row, col)
+                cx = HW + col * CW + CW / 2
+                cy = HH + row * RH + RH / 2
+                is_hover = (row == self._hover_row and col == self._hover_col)
+                gain = self.pb._connections.get(key, 0)
+
+                if gain > 0:
+                    node_color = QtGui.QColor(self.pb._device_color_for_input(row))
+                    radius = node_min_r + (node_max_r - node_min_r) * gain
+
+                    # Glow
+                    glow_color = QtGui.QColor(node_color)
+                    glow_color.setAlpha(60)
+                    glow_r = radius + max(2, node_max_r * 0.3)
+                    painter.setPen(QtCore.Qt.NoPen)
+                    painter.setBrush(glow_color)
+                    painter.drawEllipse(QtCore.QPointF(cx, cy), glow_r, glow_r)
+
+                    # Filled node
+                    painter.setBrush(node_color)
+                    painter.drawEllipse(QtCore.QPointF(cx, cy), radius, radius)
+
+                    # Gain text
+                    if (gain < 0.99 or is_hover) and radius >= 6:
+                        painter.setPen(QtGui.QColor(255, 255, 255, 200))
+                        painter.setFont(QtGui.QFont("Arial", font_tiny, QtGui.QFont.Bold))
+                        txt = f"{int(gain * 100)}"
+                        painter.drawText(
+                            QtCore.QRectF(cx - 14, cy - 6, 28, 12),
+                            QtCore.Qt.AlignCenter, txt
+                        )
+                        painter.setFont(QtGui.QFont("Arial", font_large, QtGui.QFont.Bold))
+
+                    # Hover ring
+                    if is_hover:
+                        ring_pen = QtGui.QPen(QtGui.QColor(255, 255, 255, 180), 1.5)
+                        painter.setPen(ring_pen)
+                        painter.setBrush(QtCore.Qt.NoBrush)
+                        painter.drawEllipse(QtCore.QPointF(cx, cy), radius + 2, radius + 2)
+
+                elif is_hover:
+                    dot_color = QtGui.QColor(pal['text_dim'])
+                    dot_color.setAlpha(80)
+                    painter.setPen(QtCore.Qt.NoPen)
+                    painter.setBrush(dot_color)
+                    dot_r = max(2, node_min_r * 0.7)
+                    painter.drawEllipse(QtCore.QPointF(cx, cy), dot_r, dot_r)
+
+                    ring_color = QtGui.QColor(pal['accent'])
+                    ring_color.setAlpha(120)
+                    ring_pen = QtGui.QPen(ring_color, 1.5)
+                    painter.setPen(ring_pen)
+                    painter.setBrush(QtCore.Qt.NoBrush)
+                    painter.drawEllipse(QtCore.QPointF(cx, cy), node_min_r + 2, node_min_r + 2)
+
+        painter.end()
+
+    def sizeHint(self):
+        m = self.pb._metrics(500, 400)
+        w = m['HW'] + self.pb.NUM_OUTPUTS * m['CW'] + 10
+        h = m['HH'] + max(2, self.pb.input_channel_count) * m['RH'] + 10
+        return QtCore.QSize(w, h)
+
+
+class MixerStripView(QtWidgets.QWidget):
+    """Alternative mixer-strip UI: per-track on/off, mono/stereo, volume knob, input selector."""
+
+    mapping_changed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._track_colors = THEMES['Dark']['palette']['track_colors']
+        self.input_infos = [{'label': 'A', 'channels': 2}]
+        self.input_labels = ['A1', 'A2']
+        self.input_channel_count = 2
+
+        self.strips = []  # list of strip state dicts
+
+        main_layout = QtWidgets.QVBoxLayout(self)
+        main_layout.setSpacing(6)
+
+        self.status_label = QtWidgets.QLabel("")
+        self.status_label.setStyleSheet("color: #AAAAAA; margin-top: 5px;")
+
+        # Strip container
+        self._strip_layout = QtWidgets.QHBoxLayout()
+        self._strip_layout.setSpacing(16)
+        for i in range(4):
+            strip = self._create_strip(i)
+            self.strips.append(strip)
+            self._strip_layout.addWidget(strip['widget'])
+
+        main_layout.addLayout(self._strip_layout)
+        main_layout.addWidget(self.status_label)
+        main_layout.addStretch()
+
+    def _create_strip(self, track_idx):
+        """Create a single track strip with on/off, mono/stereo, dial, and input selector."""
+        color = self._track_colors[track_idx % len(self._track_colors)]
+        frame = QtWidgets.QFrame()
+        frame.setFrameStyle(QtWidgets.QFrame.StyledPanel)
+        frame.setMinimumWidth(130)
+        layout = QtWidgets.QVBoxLayout(frame)
+        layout.setSpacing(8)
+        layout.setContentsMargins(10, 10, 10, 10)
+
+        # Track title
+        title = QtWidgets.QLabel(f"Track {track_idx + 1}")
+        title.setAlignment(QtCore.Qt.AlignCenter)
+        title.setStyleSheet(f"font-weight: bold; font-size: 13px; color: {color};")
+        layout.addWidget(title)
+
+        # On/Off toggle
+        on_btn = QtWidgets.QPushButton("ON")
+        on_btn.setCheckable(True)
+        on_btn.setChecked(True)
+        on_btn.setStyleSheet(self._toggle_style(True, color))
+        on_btn.toggled.connect(lambda checked, b=on_btn, c=color: self._on_toggle(b, checked, c))
+        layout.addWidget(on_btn)
+
+        # Mono/Stereo toggle
+        stereo_btn = QtWidgets.QPushButton("STEREO")
+        stereo_btn.setCheckable(True)
+        stereo_btn.setChecked(True)  # default stereo
+        stereo_btn.toggled.connect(lambda checked, b=stereo_btn: self._stereo_toggle(b, checked))
+        layout.addWidget(stereo_btn)
+
+        # Volume knob
+        vol_label = QtWidgets.QLabel("Volume")
+        vol_label.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(vol_label)
+
+        dial = QtWidgets.QDial()
+        dial.setRange(0, 100)
+        dial.setValue(100)
+        dial.setNotchesVisible(True)
+        dial.setFixedSize(80, 80)
+        dial.valueChanged.connect(lambda v, lbl=vol_label: lbl.setText(f"Vol: {v}%"))
+        dial.valueChanged.connect(lambda: self.mapping_changed.emit())
+        dial_container = QtWidgets.QHBoxLayout()
+        dial_container.addStretch()
+        dial_container.addWidget(dial)
+        dial_container.addStretch()
+        layout.addLayout(dial_container)
+
+        # Input selector
+        input_label = QtWidgets.QLabel("Input:")
+        input_label.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(input_label)
+
+        input_combo = QtWidgets.QComboBox()
+        self._populate_input_combo(input_combo)
+        input_combo.currentIndexChanged.connect(lambda: self.mapping_changed.emit())
+        layout.addWidget(input_combo)
+
+        layout.addStretch()
+
+        return {
+            'widget': frame,
+            'title': title,
+            'on_btn': on_btn,
+            'stereo_btn': stereo_btn,
+            'dial': dial,
+            'vol_label': vol_label,
+            'input_combo': input_combo,
+            'track_idx': track_idx,
+        }
+
+    def _toggle_style(self, is_on, color):
+        if is_on:
+            return f"background-color: {color}; color: white; font-weight: bold; padding: 6px;"
+        return "background-color: #555555; color: #999999; font-weight: bold; padding: 6px;"
+
+    def _on_toggle(self, btn, checked, color):
+        btn.setText("ON" if checked else "OFF")
+        btn.setStyleSheet(self._toggle_style(checked, color))
+        self.mapping_changed.emit()
+
+    def _stereo_toggle(self, btn, checked):
+        btn.setText("STEREO" if checked else "MONO")
+        self.mapping_changed.emit()
+
+    def _populate_input_combo(self, combo):
+        """Populate a single input combo with stereo pairs."""
+        combo.clear()
+        offset = 0
+        for info in self.input_infos:
+            dev_label = info['label']
+            ch = info['channels']
+            num_pairs = max(1, ch // 2)
+            for p in range(num_pairs):
+                ch_lo = p * 2 + 1
+                ch_hi = ch_lo + 1
+                combo.addItem(f"{dev_label} {ch_lo}-{ch_hi}", offset + p * 2)
+            offset += ch
+
+    def update_for_inputs(self, input_infos):
+        """Rebuild input pair combos when input devices change."""
+        self.input_infos = input_infos
+        labels = []
+        for info in input_infos:
+            for ch in range(info['channels']):
+                labels.append(f"{info['label']}{ch+1}")
+        self.input_channel_count = len(labels)
+        self.input_labels = labels
+        for strip in self.strips:
+            prev = strip['input_combo'].currentData()
+            self._populate_input_combo(strip['input_combo'])
+            # Try to restore previous selection
+            if prev is not None:
+                idx = strip['input_combo'].findData(prev)
+                if idx >= 0:
+                    strip['input_combo'].setCurrentIndex(idx)
+
+    def get_mapping(self):
+        """Return mapping in the same format as TrackMapperWidget.get_mapping().
+
+        Returns a flat list of 8 entries (4 tracks x 2 channels).
+        Each entry is a list of {index, gain} dicts.
+        """
+        mapping = []
+        for strip in self.strips:
+            enabled = strip['on_btn'].isChecked()
+            is_stereo = strip['stereo_btn'].isChecked()
+            volume = strip['dial'].value() / 100.0
+            pair_start = strip['input_combo'].currentData()
+            if pair_start is None:
+                pair_start = 0
+
+            if not enabled:
+                mapping.extend([[], []])
+                continue
+
+            left_idx = pair_start
+            right_idx = pair_start + (1 if is_stereo else 0)
+            mapping.append([{'index': left_idx, 'gain': volume}])
+            mapping.append([{'index': right_idx, 'gain': volume}])
+        return mapping
+
+    def set_mapping(self, mapping):
+        """Best-effort restore from a TrackMapperWidget-style mapping."""
+        for track_idx in range(4):
+            if track_idx >= len(self.strips):
+                break
+            strip = self.strips[track_idx]
+            left_entry = mapping[track_idx * 2] if track_idx * 2 < len(mapping) else []
+            right_entry = mapping[track_idx * 2 + 1] if track_idx * 2 + 1 < len(mapping) else []
+
+            has_signal = bool(left_entry) or bool(right_entry)
+            strip['on_btn'].setChecked(has_signal)
+
+            if left_entry and isinstance(left_entry, list) and len(left_entry) > 0:
+                src = left_entry[0]
+                if isinstance(src, dict):
+                    idx = src.get('index', 0)
+                    gain = src.get('gain', 1.0)
+                    strip['dial'].setValue(int(gain * 100))
+                    # Find the closest pair start
+                    pair_start = (idx // 2) * 2
+                    combo_idx = strip['input_combo'].findData(pair_start)
+                    if combo_idx >= 0:
+                        strip['input_combo'].setCurrentIndex(combo_idx)
+
+                    # Detect mono vs stereo
+                    if right_entry and isinstance(right_entry, list) and len(right_entry) > 0:
+                        r_src = right_entry[0]
+                        if isinstance(r_src, dict):
+                            r_idx = r_src.get('index', 0)
+                            strip['stereo_btn'].setChecked(r_idx != idx)
+
+    def get_track_color(self, track_idx):
+        return self._track_colors[track_idx % len(self._track_colors)]
+
+    def _refresh_track_colors(self):
+        for strip in self.strips:
+            i = strip['track_idx']
+            color = self.get_track_color(i)
+            strip['title'].setStyleSheet(f"font-weight: bold; font-size: 13px; color: {color};")
+            if strip['on_btn'].isChecked():
+                strip['on_btn'].setStyleSheet(self._toggle_style(True, color))
+
+
 class MainWindow(QtWidgets.QMainWindow):
     """Main application window with enhanced visualizations"""
     def __init__(self):
         super().__init__()
-        
+
         self.audio_manager = AudioManager()
         self.update_timer = QtCore.QTimer()
         self.update_timer.timeout.connect(self.update_visualization)
@@ -1902,29 +2648,47 @@ class MainWindow(QtWidgets.QMainWindow):
         main_layout = QtWidgets.QVBoxLayout(central_widget)
         main_layout.setSpacing(12)
         
+        # Theme state
+        self._current_theme = 'Dark'
+
+        # Menu bar — View > Theme
+        menubar = self.menuBar()
+        view_menu = menubar.addMenu("View")
+        theme_menu = view_menu.addMenu("Theme")
+        self._theme_actions = {}
+        theme_group = QtWidgets.QActionGroup(self)
+        theme_group.setExclusive(True)
+        for name in THEMES:
+            action = theme_menu.addAction(name)
+            action.setCheckable(True)
+            action.setChecked(name == 'Dark')
+            theme_group.addAction(action)
+            action.triggered.connect(lambda checked, n=name: self.apply_theme(n))
+            self._theme_actions[name] = action
+
         # Title and version
         title_layout = QtWidgets.QHBoxLayout()
-        title = QtWidgets.QLabel("LF Music Mapper")
-        title.setStyleSheet("font-size: 20px; font-weight: bold; color: #EEEEEE;")
-        title_layout.addWidget(title)
-        
-        version = QtWidgets.QLabel("By: @LofiFren")
-        version.setStyleSheet("font-size: 14px; color: #AAAAAA;")
-        version.setAlignment(QtCore.Qt.AlignBottom)
-        title_layout.addWidget(version)
-        
+        self._title_label = QtWidgets.QLabel("LF Music Mapper")
+        self._title_label.setStyleSheet("font-size: 20px; font-weight: bold; color: #EEEEEE;")
+        title_layout.addWidget(self._title_label)
+
+        self._version_label = QtWidgets.QLabel("By: @LofiFren")
+        self._version_label.setStyleSheet("font-size: 14px; color: #AAAAAA;")
+        self._version_label.setAlignment(QtCore.Qt.AlignBottom)
+        title_layout.addWidget(self._version_label)
+
         title_layout.addStretch()
-        
+
         main_layout.addLayout(title_layout)
-        
+
         # Inline helper text to replace the old popup dialog
-        intro_text = QtWidgets.QLabel(
+        self._intro_label = QtWidgets.QLabel(
             "Route any available input into dedicated multichannel outputs. "
             "Choose your devices, define the mapping on the left, and monitor your signal on the right."
         )
-        intro_text.setStyleSheet("color: #BBBBBB; font-size: 12px;")
-        intro_text.setWordWrap(True)
-        main_layout.addWidget(intro_text)
+        self._intro_label.setStyleSheet("color: #BBBBBB; font-size: 12px;")
+        self._intro_label.setWordWrap(True)
+        main_layout.addWidget(self._intro_label)
         
         # Split the primary UI into routing controls (left) and visualization (right)
         content_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
@@ -1952,34 +2716,34 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # -- Inputs (left) --
         # Input A (always active)
-        input_a_label = QtWidgets.QLabel("Input A:")
-        input_a_label.setStyleSheet("font-weight: bold; color: #4B9DE0;")
-        device_layout.addWidget(input_a_label, 0, 0)
+        self._input_a_label = QtWidgets.QLabel("Input A:")
+        self._input_a_label.setStyleSheet("font-weight: bold; color: #4B9DE0;")
+        device_layout.addWidget(self._input_a_label, 0, 0)
         self.input_combo_a = QtWidgets.QComboBox()
         self.input_combo_a.currentIndexChanged.connect(self.input_device_changed)
         device_layout.addWidget(self.input_combo_a, 0, 1)
 
         # Input B (optional)
-        input_b_label = QtWidgets.QLabel("Input B:")
-        input_b_label.setStyleSheet("font-weight: bold; color: #50C878;")
-        device_layout.addWidget(input_b_label, 1, 0)
+        self._input_b_label = QtWidgets.QLabel("Input B:")
+        self._input_b_label.setStyleSheet("font-weight: bold; color: #50C878;")
+        device_layout.addWidget(self._input_b_label, 1, 0)
         self.input_combo_b = QtWidgets.QComboBox()
         self.input_combo_b.currentIndexChanged.connect(self.input_device_changed)
         device_layout.addWidget(self.input_combo_b, 1, 1)
 
         # Input C (optional)
-        input_c_label = QtWidgets.QLabel("Input C:")
-        input_c_label.setStyleSheet("font-weight: bold; color: #E6A23C;")
-        device_layout.addWidget(input_c_label, 2, 0)
+        self._input_c_label = QtWidgets.QLabel("Input C:")
+        self._input_c_label.setStyleSheet("font-weight: bold; color: #E6A23C;")
+        device_layout.addWidget(self._input_c_label, 2, 0)
         self.input_combo_c = QtWidgets.QComboBox()
         self.input_combo_c.currentIndexChanged.connect(self.input_device_changed)
         device_layout.addWidget(self.input_combo_c, 2, 1)
 
         # -- Outputs (right) — same color scheme as inputs --
         # Output A (always active)
-        out_a_label = QtWidgets.QLabel("Output A:")
-        out_a_label.setStyleSheet("font-weight: bold; color: #4B9DE0;")
-        device_layout.addWidget(out_a_label, 0, 2)
+        self._out_a_label = QtWidgets.QLabel("Output A:")
+        self._out_a_label.setStyleSheet("font-weight: bold; color: #4B9DE0;")
+        device_layout.addWidget(self._out_a_label, 0, 2)
         self.output_combo_a = QtWidgets.QComboBox()
         self.output_combo_a.currentIndexChanged.connect(lambda: self.output_device_changed('A'))
         device_layout.addWidget(self.output_combo_a, 0, 3)
@@ -1987,9 +2751,9 @@ class MainWindow(QtWidgets.QMainWindow):
         device_layout.addWidget(self.channels_combo_a, 0, 4)
 
         # Output B (optional)
-        out_b_label = QtWidgets.QLabel("Output B:")
-        out_b_label.setStyleSheet("font-weight: bold; color: #50C878;")
-        device_layout.addWidget(out_b_label, 1, 2)
+        self._out_b_label = QtWidgets.QLabel("Output B:")
+        self._out_b_label.setStyleSheet("font-weight: bold; color: #50C878;")
+        device_layout.addWidget(self._out_b_label, 1, 2)
         self.output_combo_b = QtWidgets.QComboBox()
         self.output_combo_b.currentIndexChanged.connect(lambda: self.output_device_changed('B'))
         device_layout.addWidget(self.output_combo_b, 1, 3)
@@ -1997,9 +2761,9 @@ class MainWindow(QtWidgets.QMainWindow):
         device_layout.addWidget(self.channels_combo_b, 1, 4)
 
         # Output C (optional)
-        out_c_label = QtWidgets.QLabel("Output C:")
-        out_c_label.setStyleSheet("font-weight: bold; color: #E6A23C;")
-        device_layout.addWidget(out_c_label, 2, 2)
+        self._out_c_label = QtWidgets.QLabel("Output C:")
+        self._out_c_label.setStyleSheet("font-weight: bold; color: #E6A23C;")
+        device_layout.addWidget(self._out_c_label, 2, 2)
         self.output_combo_c = QtWidgets.QComboBox()
         self.output_combo_c.currentIndexChanged.connect(lambda: self.output_device_changed('C'))
         device_layout.addWidget(self.output_combo_c, 2, 3)
@@ -2033,26 +2797,52 @@ class MainWindow(QtWidgets.QMainWindow):
         mapper_layout.setContentsMargins(10, 10, 10, 10)
         mapper_layout.setSpacing(8)
 
-        mapper_hint = QtWidgets.QLabel(
+        # View toggle: Detail vs Mixer
+        view_row = QtWidgets.QHBoxLayout()
+        self._mapper_hint = QtWidgets.QLabel(
             "Assign which input feeds every left/right channel per output. Use presets for quick stereo or mono setups."
         )
-        mapper_hint.setStyleSheet("color: #BBBBBB; font-size: 12px;")
-        mapper_hint.setWordWrap(True)
-        mapper_layout.addWidget(mapper_hint)
+        self._mapper_hint.setStyleSheet("color: #BBBBBB; font-size: 12px;")
+        self._mapper_hint.setWordWrap(True)
+        view_row.addWidget(self._mapper_hint, stretch=1)
 
+        self._view_detail_btn = QtWidgets.QPushButton("Patchbay")
+        self._view_mixer_btn = QtWidgets.QPushButton("Mixer")
+        self._view_detail_btn.setCheckable(True)
+        self._view_mixer_btn.setCheckable(True)
+        self._view_mixer_btn.setChecked(True)  # Mixer is default
+        self._view_detail_btn.setFixedWidth(80)
+        self._view_mixer_btn.setFixedWidth(70)
+        self._view_detail_btn.clicked.connect(lambda: self._switch_view('detail'))
+        self._view_mixer_btn.clicked.connect(lambda: self._switch_view('mixer'))
+        view_row.addWidget(self._view_detail_btn)
+        view_row.addWidget(self._view_mixer_btn)
+        mapper_layout.addLayout(view_row)
+
+        self._current_view = 'mixer'  # Mixer is the default view
+
+        # Patchbay view: per-output PatchbayView tabs
         self.mapper_tabs = QtWidgets.QTabWidget()
-        self.track_mappers = {}  # 'A'/'B'/'C' -> TrackMapperWidget
+        self.track_mappers = {}  # 'A'/'B'/'C' -> PatchbayView
 
-        # Output A mapper is always present
-        mapper_a = TrackMapperWidget()
+        mapper_a = PatchbayView()
         mapper_a.mapping_changed.connect(lambda: self.apply_mapping(0))
         self.track_mappers['A'] = mapper_a
         self.mapper_tabs.addTab(mapper_a, "Output A")
+        self.track_mapper = mapper_a  # backward compat
+        self.mapper_tabs.setVisible(False)  # hidden by default (mixer is default)
 
-        # Backward compat: self.track_mapper points to the primary mapper
-        self.track_mapper = mapper_a
+        # Mixer view: per-output MixerStripView tabs
+        self.mixer_tabs = QtWidgets.QTabWidget()
+        self.mixer_views = {}  # 'A'/'B'/'C' -> MixerStripView
+
+        mixer_a = MixerStripView()
+        mixer_a.mapping_changed.connect(lambda: self.apply_mapping(0))
+        self.mixer_views['A'] = mixer_a
+        self.mixer_tabs.addTab(mixer_a, "Output A")
 
         mapper_layout.addWidget(self.mapper_tabs)
+        mapper_layout.addWidget(self.mixer_tabs)
         mapper_group.setLayout(mapper_layout)
         left_layout.addWidget(mapper_group)
         left_layout.addStretch()
@@ -2113,7 +2903,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._track_label_states = []  # track previous state to avoid redundant updates
         for i in range(4):
             label = QtWidgets.QLabel(f"Track {i+1}: Silent")
-            label.setStyleSheet(f"color: {self.get_track_color(i)}; font-weight: bold; padding: 8px 12px; border-radius: 3px; background-color: #2D2D30;")
+            label.setStyleSheet(f"color: {self.get_track_color(i)}; font-weight: bold; padding: 8px 12px; border-radius: 3px; background-color: {THEMES[self._current_theme]['palette']['bg_primary']};")
             label.setMinimumHeight(30)
             label.setMinimumWidth(140)
             label.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
@@ -2126,15 +2916,11 @@ class MainWindow(QtWidgets.QMainWindow):
         return viz_container
     
     def get_track_color(self, track_idx):
-        """Get color for a specific track"""
-        colors = [
-            "#4B9DE0",  # Track 1 - Blue
-            "#50C878",  # Track 2 - Green
-            "#E6A23C",  # Track 3 - Orange
-            "#E77F7F"   # Track 4 - Red
-        ]
+        """Get color for a specific track from the current theme."""
+        palette = THEMES.get(self._current_theme, THEMES['Dark'])['palette']
+        colors = palette['track_colors']
         return colors[track_idx % len(colors)]
-    
+
     def update_track_labels(self, num_tracks):
         """Update track labels based on number of tracks"""
         # Show only the active track labels
@@ -2143,7 +2929,113 @@ class MainWindow(QtWidgets.QMainWindow):
                 label.setVisible(True)
             else:
                 label.setVisible(False)
-    
+
+    def apply_theme(self, theme_name):
+        """Switch the entire UI to a new color theme."""
+        if theme_name not in THEMES:
+            return
+        self._current_theme = theme_name
+        theme = THEMES[theme_name]
+        palette = theme['palette']
+
+        # 1. App-level QSS
+        QtWidgets.QApplication.instance().setStyleSheet(generate_qss(palette))
+
+        # 2. Inline-styled widgets
+        self._apply_inline_styles(palette)
+
+        # 3. Spectrogram colors
+        lut = build_spectrogram_lut(theme['spectrogram_stops'])
+        self.spectrogram_3d.set_color_lut(lut, theme['spectrogram_bg'])
+
+        # 4. Level meter colors
+        self.level_meters.set_meter_zones(
+            theme['meter_zones'], theme['meter_peak_zones'], palette
+        )
+
+        # 5. Update track label colors in visualization
+        for i, label in enumerate(self.track_labels):
+            color = self.get_track_color(i)
+            label.setStyleSheet(
+                f"color: {color}; font-weight: bold; padding: 8px 12px; "
+                f"border-radius: 3px; background-color: {palette['bg_primary']};"
+            )
+        self._track_label_states = [None] * len(self._track_label_states)
+
+        # 6. Update track mapper and mixer view track colors
+        for mapper in self.track_mappers.values():
+            mapper._track_colors = palette['track_colors']
+            mapper._refresh_track_colors()
+        for mixer in self.mixer_views.values():
+            mixer._track_colors = palette['track_colors']
+            mixer._refresh_track_colors()
+
+        # 7. Check the right menu action
+        if theme_name in self._theme_actions:
+            self._theme_actions[theme_name].setChecked(True)
+
+    def _apply_inline_styles(self, palette):
+        """Re-apply inline styles to widgets that use setStyleSheet directly."""
+        tc = palette['track_colors']
+
+        # Title / version / hint labels
+        self._title_label.setStyleSheet(
+            f"font-size: 20px; font-weight: bold; color: {palette['text_bright']};"
+        )
+        self._version_label.setStyleSheet(
+            f"font-size: 14px; color: {palette['text_secondary']};"
+        )
+        self._intro_label.setStyleSheet(
+            f"color: {palette['text_dim']}; font-size: 12px;"
+        )
+        self._mapper_hint.setStyleSheet(
+            f"color: {palette['text_dim']}; font-size: 12px;"
+        )
+
+        # Device labels — A/B/C use first 3 track colors
+        self._input_a_label.setStyleSheet(f"font-weight: bold; color: {tc[0]};")
+        self._input_b_label.setStyleSheet(f"font-weight: bold; color: {tc[1]};")
+        self._input_c_label.setStyleSheet(f"font-weight: bold; color: {tc[2]};")
+        self._out_a_label.setStyleSheet(f"font-weight: bold; color: {tc[0]};")
+        self._out_b_label.setStyleSheet(f"font-weight: bold; color: {tc[1]};")
+        self._out_c_label.setStyleSheet(f"font-weight: bold; color: {tc[2]};")
+
+        # Route button — danger style only when routing is active
+        if self.audio_manager.output_streams:
+            self.route_btn.setStyleSheet(
+                f"background-color: {palette['danger']}; color: white; "
+                f"font-weight: bold; min-height: 35px; border-radius: 5px;"
+            )
+
+    def _switch_view(self, mode):
+        """Switch between 'detail' (patchbay) and 'mixer' view modes."""
+        if mode == self._current_view:
+            return
+
+        # Transfer mapping from current view → target view
+        for label in list(self.track_mappers.keys()):
+            if mode == 'mixer' and label in self.mixer_views:
+                # Patchbay → Mixer
+                mapping = self.track_mappers[label].get_mapping()
+                self.mixer_views[label].set_mapping(mapping)
+            elif mode == 'detail' and label in self.mixer_views:
+                # Mixer → Patchbay
+                mapping = self.mixer_views[label].get_mapping()
+                self.track_mappers[label].set_mapping(mapping)
+
+        if mode == 'mixer':
+            self.mapper_tabs.setVisible(False)
+            self.mixer_tabs.setVisible(True)
+            self._view_detail_btn.setChecked(False)
+            self._view_mixer_btn.setChecked(True)
+        else:
+            self.mixer_tabs.setVisible(False)
+            self.mapper_tabs.setVisible(True)
+            self._view_detail_btn.setChecked(True)
+            self._view_mixer_btn.setChecked(False)
+
+        self._current_view = mode
+
     def get_input_infos(self):
         """Get info for all enabled input devices.
 
@@ -2201,6 +3093,8 @@ class MainWindow(QtWidgets.QMainWindow):
             # Update all active track mapper tabs with device labels
             for slot, mapper in self.track_mappers.items():
                 mapper.update_for_inputs(input_infos)
+            for slot, mixer in self.mixer_views.items():
+                mixer.update_for_inputs(input_infos)
 
             # Auto-assign devices to tracks on primary output mapper
             output_channels = self.channels_combo_a.currentData()
@@ -2222,9 +3116,15 @@ class MainWindow(QtWidgets.QMainWindow):
             # Update level meters
             self.level_meters.set_levels(levels)
 
-            # Feed 3D spectrogram with first stereo pair (combined overview)
-            left_data = self.audio_manager.get_audio_data(0)
-            right_data = self.audio_manager.get_audio_data(1)
+            # Feed 3D spectrogram with mix of ALL active output channels
+            output_channels = self.channels_combo_a.currentData() or 2
+            num_ch = min(output_channels, 8)
+            left_data = np.zeros_like(self.audio_manager.get_audio_data(0))
+            right_data = np.zeros_like(left_data)
+            for ch in range(0, num_ch, 2):
+                left_data = np.maximum(left_data, np.abs(self.audio_manager.get_audio_data(ch)))
+                if ch + 1 < num_ch:
+                    right_data = np.maximum(right_data, np.abs(self.audio_manager.get_audio_data(ch + 1)))
             self.spectrogram_3d.update_audio_data(left_data, right_data)
 
             # Get selected channel count (primary output)
@@ -2251,15 +3151,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 if self._track_label_states[i] != state:
                     self._track_label_states[i] = state
                     color = self.get_track_color(i)
+                    pal = THEMES[self._current_theme]['palette']
                     if state == "active":
                         self.track_labels[i].setText(f"Track {i+1}: Active")
-                        self.track_labels[i].setStyleSheet(f"color: {color}; font-weight: bold; padding: 5px; border-radius: 3px; background-color: #1E3A29;")
+                        self.track_labels[i].setStyleSheet(f"color: {color}; font-weight: bold; padding: 5px; border-radius: 3px; background-color: {pal['signal_active_bg']};")
                     elif state == "low":
                         self.track_labels[i].setText(f"Track {i+1}: Low signal")
-                        self.track_labels[i].setStyleSheet(f"color: {color}; font-weight: bold; padding: 5px; border-radius: 3px; background-color: #3A3A1E;")
+                        self.track_labels[i].setStyleSheet(f"color: {color}; font-weight: bold; padding: 5px; border-radius: 3px; background-color: {pal['signal_low_bg']};")
                     else:
                         self.track_labels[i].setText(f"Track {i+1}: Silent")
-                        self.track_labels[i].setStyleSheet(f"color: {color}; font-weight: bold; padding: 5px; border-radius: 3px; background-color: #2D2D30;")
+                        self.track_labels[i].setStyleSheet(f"color: {color}; font-weight: bold; padding: 5px; border-radius: 3px; background-color: {pal['bg_primary']};")
     
     def _populate_input_combo(self, combo, add_placeholder=False):
         """Populate an input combo with available input devices."""
@@ -2377,25 +3278,37 @@ class MainWindow(QtWidgets.QMainWindow):
             if slot == 'A':
                 self.input_device_changed()
 
-        # Manage per-output mapper tabs for B and C
+        # Manage per-output mapper tabs AND mixer tabs for B and C
         if slot in ('B', 'C') and hasattr(self, 'mapper_tabs'):
+            out_idx = {'B': 1, 'C': 2}[slot]
             if is_enabled and slot not in self.track_mappers:
-                # Add a new mapper tab for this output
-                mapper = TrackMapperWidget()
-                out_idx = {'B': 1, 'C': 2}[slot]
+                # Add new patchbay tab
+                mapper = PatchbayView()
                 mapper.mapping_changed.connect(lambda oi=out_idx: self.apply_mapping(oi))
                 self.track_mappers[slot] = mapper
                 self.mapper_tabs.addTab(mapper, f"Output {slot}")
+                # Add new mixer tab
+                mixer = MixerStripView()
+                mixer.mapping_changed.connect(lambda oi=out_idx: self.apply_mapping(oi))
+                self.mixer_views[slot] = mixer
+                self.mixer_tabs.addTab(mixer, f"Output {slot}")
                 # Initialize with current input info
                 input_infos = self.get_input_infos()
                 if input_infos:
                     mapper.update_for_inputs(input_infos)
+                    mixer.update_for_inputs(input_infos)
             elif not is_enabled and slot in self.track_mappers:
-                # Remove the mapper tab
+                # Remove detail mapper tab
                 mapper = self.track_mappers.pop(slot)
                 idx = self.mapper_tabs.indexOf(mapper)
                 if idx >= 0:
                     self.mapper_tabs.removeTab(idx)
+                # Remove mixer tab
+                if slot in self.mixer_views:
+                    mixer = self.mixer_views.pop(slot)
+                    idx = self.mixer_tabs.indexOf(mixer)
+                    if idx >= 0:
+                        self.mixer_tabs.removeTab(idx)
 
     
     def toggle_routing(self):
@@ -2444,13 +3357,11 @@ class MainWindow(QtWidgets.QMainWindow):
             # Start routing with all enabled inputs and outputs
             if self.audio_manager.start_routing(input_devices, output_devices, sample_rate=sample_rate):
                 self.route_btn.setText("Stop Routing")
-                self.route_btn.setStyleSheet("""
-                    background-color: #B33A3A;
-                    color: white;
-                    font-weight: bold;
-                    min-height: 35px;
-                    border-radius: 5px;
-                """)
+                danger = THEMES[self._current_theme]['palette']['danger']
+                self.route_btn.setStyleSheet(
+                    f"background-color: {danger}; color: white; "
+                    f"font-weight: bold; min-height: 35px; border-radius: 5px;"
+                )
 
                 # Disable all device selectors while routing
                 for combo in [self.input_combo_a, self.input_combo_b, self.input_combo_c,
@@ -2477,7 +3388,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def apply_mapping(self, output_idx=0):
         """Apply the current track mapping to the audio manager for a specific output."""
         label = ['A', 'B', 'C'][output_idx] if output_idx < 3 else 'A'
-        mapper = self.track_mappers.get(label)
+        if self._current_view == 'mixer':
+            mapper = self.mixer_views.get(label)
+        else:
+            mapper = self.track_mappers.get(label)
         if mapper is None:
             return
 
@@ -2528,131 +3442,8 @@ def main():
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle('Fusion')  # Use Fusion style for consistent look
     
-    # Set application stylesheet for modern flat design
-    app.setStyleSheet("""
-        QMainWindow, QWidget {
-            background-color: #2D2D30;
-            color: #F0F0F0;
-        }
-        QGroupBox {
-            border: 1px solid #3F3F46;
-            border-radius: 8px;
-            margin-top: 1.5ex;
-            font-weight: bold;
-            padding: 10px;
-            background-color: #252526;
-        }
-        QGroupBox::title {
-            subcontrol-origin: margin;
-            subcontrol-position: top center;
-            padding: 0 8px;
-            background-color: #2D2D30;
-        }
-        QComboBox {
-            background-color: #333337;
-            border: 1px solid #3F3F46;
-            border-radius: 5px;
-            padding: 6px;
-            color: #F0F0F0;
-            min-height: 25px;
-        }
-        QComboBox:hover {
-            border-color: #007ACC;
-        }
-        QComboBox::drop-down {
-            border: none;
-            width: 20px;
-        }
-        QPushButton {
-            background-color: #333337;
-            border: 1px solid #3F3F46;
-            border-radius: 5px;
-            padding: 6px;
-            color: #F0F0F0;
-            min-height: 25px;
-        }
-        QPushButton:hover {
-            background-color: #3E3E40;
-            border-color: #007ACC;
-        }
-        QPushButton:pressed {
-            background-color: #007ACC;
-        }
-        QLabel {
-            padding: 2px;
-        }
-        QStatusBar {
-            background-color: #1E1E1E;
-            color: #CCCCCC;
-        }
-        QCheckBox {
-            spacing: 5px;
-        }
-        QCheckBox::indicator {
-            width: 18px;
-            height: 18px;
-            border-radius: 3px;
-        }
-        QTabWidget::pane {
-            border: 1px solid #3F3F46;
-            border-radius: 5px;
-            background: #252526;
-        }
-        QTabBar::tab {
-            background: #2D2D30;
-            border: 1px solid #3F3F46;
-            border-bottom-color: #252526;
-            border-top-left-radius: 4px;
-            border-top-right-radius: 4px;
-            padding: 6px 10px;
-            margin-right: 2px;
-        }
-        QTabBar::tab:selected, QTabBar::tab:hover {
-            background: #333337;
-        }
-        QTabBar::tab:selected {
-            border-bottom-color: #252526;
-        }
-        QSlider::groove:horizontal {
-            border: 1px solid #3F3F46;
-            height: 8px;
-            background: #2D2D30;
-            margin: 2px 0;
-            border-radius: 4px;
-        }
-        QSlider::handle:horizontal {
-            background: #007ACC;
-            border: 1px solid #007ACC;
-            width: 18px;
-            height: 18px;
-            margin: -6px 0;
-            border-radius: 9px;
-        }
-        QSlider::handle:horizontal:hover {
-            background: #1C97EA;
-        }
-        
-        /* Apply button style */
-        #applyButton {
-            background-color: #2C5AA0;
-            color: white;
-            font-weight: bold;
-            min-height: 35px;
-            border-radius: 5px;
-        }
-        #applyButton:hover {
-            background-color: #3771C8;
-        }
-        
-        /* Preset button styles */
-        QPushButton[preset="true"] {
-            background-color: #424245;
-            border-width: 1px;
-        }
-        QPushButton[preset="true"]:hover {
-            background-color: #4D4D52;
-        }
-    """)
+    # Apply the default Dark theme via themes.py
+    app.setStyleSheet(generate_qss(THEMES['Dark']['palette']))
     
     window = MainWindow()
     window.show()
