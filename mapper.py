@@ -11,7 +11,20 @@ from threading import Thread
 from collections import deque
 from scipy.fft import fft  # For spectrum analysis
 
-DEBUG = False
+# macOS-only: programmatic CoreAudio aggregate device creation for split
+# USB devices (e.g. S-4 enumerated as separate input/output entries).
+_HAS_COREAUDIO_AGG = False
+if sys.platform == 'darwin':
+    try:
+        from coreaudio_aggregate import (
+            get_uids_for_device_name, create_aggregate_device,
+            destroy_aggregate_device, AGG_DEVICE_NAME,
+        )
+        _HAS_COREAUDIO_AGG = True
+    except Exception:
+        pass
+
+DEBUG = True
 
 def dbg(*args, **kwargs):
     """Print only when DEBUG is enabled."""
@@ -41,7 +54,7 @@ class AudioManager:
     def __init__(self):
         self.pa = pyaudio.PyAudio()
         self.input_streams = []  # List of input streams (up to 3 devices)
-        self.output_stream = None
+        self.output_streams = []  # List of output streams (up to 3 devices)
         self.is_routing = False
         self.buffer_size = 1024
         self.audio_data = np.zeros((self.buffer_size, 8), dtype=np.float32)
@@ -50,7 +63,11 @@ class AudioManager:
         self.input_raw_data = []  # Raw numpy arrays from each input device
         self.input_channel_counts = []  # Channel count per input device
         self.total_input_channels = 2  # Total channels across all input devices
-        self.num_output_channels = 8  # Default to 4 stereo tracks (8 channels)
+        self.num_output_channels = 8  # Default (for backward compat / viz)
+        self.output_channel_counts = []  # Per-output channel counts
+        self.viz_output_idx = 0  # Which output drives visualization
+
+        self._aggregate_device_ids = []  # CoreAudio aggregates (macOS only)
 
         # Audio diagnostics — always-on, lightweight, logs to file
         self._diag_file = None
@@ -65,10 +82,13 @@ class AudioManager:
         self._diag_cb_max_ms = 0.0     # slowest callback since last report
         self._diag_frame_mismatch = 0  # input frames didn't match buffer_size
 
-        # Create a dynamic mapping that uses all available inputs
-        self.track_mapping = []
+        # Per-output track mappings
+        self.track_mappings = [[]]  # List of mappings, one per output device
+        # Create a dynamic mapping for default output
+        default_mapping = []
         for i in range(self.num_output_channels):
-            self.track_mapping.append([{'index': i % self.total_input_channels, 'gain': 1.0}])
+            default_mapping.append([{'index': i % self.total_input_channels, 'gain': 1.0}])
+        self.track_mappings = [default_mapping]
         
     def update_default_mapping(self, total_input_channels):
         """Update the default mapping based on total available input channels across all devices"""
@@ -79,7 +99,10 @@ class AudioManager:
         new_mapping = []
         for i in range(self.num_output_channels):
             new_mapping.append([{'index': i % total_input_channels, 'gain': 1.0}])
-        self.track_mapping = new_mapping
+        if self.track_mappings:
+            self.track_mappings[0] = new_mapping
+        else:
+            self.track_mappings = [new_mapping]
         dbg(f"Updated default mapping for {total_input_channels} input channels")
         
     def reinitialize(self):
@@ -109,7 +132,7 @@ class AudioManager:
             dbg(f"  [{d['index']}] {d['name']} (in:{d['inputs']} out:{d['outputs']} rate:{d['rate']})")
         return devices
     
-    def set_track_mapping(self, mapping):
+    def set_track_mapping(self, mapping, output_idx=0):
         """Set channel mapping from inputs to output tracks (with gains)"""
         normalized = []
 
@@ -144,71 +167,99 @@ class AudioManager:
         if len(normalized) < self.num_output_channels:
             normalized.extend([[] for _ in range(self.num_output_channels - len(normalized))])
 
-        self.track_mapping = normalized
-        dbg(f"Track mapping set: {self.track_mapping}")
+        while len(self.track_mappings) <= output_idx:
+            self.track_mappings.append([])
+        self.track_mappings[output_idx] = normalized
+        dbg(f"Track mapping set for output {output_idx}: {normalized}")
     
-    def start_routing(self, input_devices, output_idx, output_channels=8, sample_rate=48000):
-        """Start routing audio from multiple input devices to output device.
+    def start_routing(self, input_devices, output_devices_or_idx, output_channels=8, sample_rate=48000):
+        """Start routing audio from multiple input devices to output device(s).
 
-        input_devices: list of {'index': int, 'channels': int} dicts
-        sample_rate: desired sample rate in Hz (default 48000)
+        input_devices:          list of {'index': int, 'channels': int} dicts
+        output_devices_or_idx:  list of {'index': int, 'channels': int, 'label': str}
+                                OR a single int (legacy: output device index)
+        output_channels:        used only with legacy int form (default 8)
+        sample_rate:            desired sample rate in Hz (default 48000)
         """
         if self.is_routing:
             self.stop_routing()
 
-        try:
-            self.num_output_channels = output_channels
+        # Normalize to list-of-dicts format
+        if isinstance(output_devices_or_idx, int):
+            output_devices = [{'index': output_devices_or_idx,
+                               'channels': output_channels, 'label': 'A'}]
+        else:
+            output_devices = output_devices_or_idx
 
-            output_info = self.pa.get_device_info_by_index(output_idx)
-            max_out_channels = int(output_info['maxOutputChannels'])
+        try:
+            # Use first output's channel count as the default for viz/meters
+            self.num_output_channels = output_devices[0]['channels']
+            self.output_channel_counts = [d['channels'] for d in output_devices]
 
             dbg(f"\n----- AUDIO DEVICE DETAILS -----")
             for i, dev in enumerate(input_devices):
                 info = self.pa.get_device_info_by_index(dev['index'])
                 label = chr(ord('A') + i)
                 dbg(f"Input {label}: {info['name']} ({dev['channels']} ch)")
-            dbg(f"Output: {output_info['name']} ({max_out_channels} ch)")
-
-            if output_channels > max_out_channels:
-                dbg(f"Warning: Limiting output to {max_out_channels} channels")
-                self.num_output_channels = max_out_channels
+            for i, dev in enumerate(output_devices):
+                info = self.pa.get_device_info_by_index(dev['index'])
+                max_ch = int(info['maxOutputChannels'])
+                if dev['channels'] > max_ch:
+                    dbg(f"Warning: Output {dev['label']} limited to {max_ch} channels")
+                    dev['channels'] = max_ch
+                    self.output_channel_counts[i] = max_ch
+                dbg(f"Output {dev['label']}: {info['name']} ({dev['channels']} ch)")
 
             rate = int(sample_rate)
 
             self.input_channel_counts = [d['channels'] for d in input_devices]
             self.total_input_channels = sum(self.input_channel_counts)
 
-            tracks = self.num_output_channels // 2
-            dbg(f"\n*** {len(input_devices)} input device(s), {self.total_input_channels} total input channels ***")
-            dbg(f"Output: {self.num_output_channels} channels ({tracks} stereo tracks)")
+            dbg(f"\n*** {len(input_devices)} input(s), {self.total_input_channels} in-ch | "
+                f"{len(output_devices)} output(s) ***")
 
-            # Dump current mapping
-            dbg(f"\nTrack mapping ({len(self.track_mapping)} entries):")
-            for out_ch, entry in enumerate(self.track_mapping):
-                t = out_ch // 2 + 1
-                lr = "L" if out_ch % 2 == 0 else "R"
-                if entry:
-                    sources = ", ".join(f"ch{e.get('index')}@{e.get('gain',1.0)*100:.0f}%" for e in (entry if isinstance(entry, list) else [entry]))
-                    dbg(f"  Track {t}.{lr} (out_ch {out_ch}) <- {sources}")
-                else:
-                    dbg(f"  Track {t}.{lr} (out_ch {out_ch}) <- [silence]")
+            # Dump per-output mappings
+            for oi, od in enumerate(output_devices):
+                mapping = self.track_mappings[oi] if oi < len(self.track_mappings) else []
+                tracks = od['channels'] // 2
+                dbg(f"\nOutput {od['label']} mapping ({od['channels']} ch, {tracks} tracks):")
+                for out_ch, entry in enumerate(mapping):
+                    if out_ch >= od['channels']:
+                        break
+                    t = out_ch // 2 + 1
+                    lr = "L" if out_ch % 2 == 0 else "R"
+                    if entry:
+                        sources = ", ".join(
+                            f"ch{e.get('index')}@{e.get('gain',1.0)*100:.0f}%"
+                            for e in (entry if isinstance(entry, list) else [entry]))
+                        dbg(f"  Track {t}.{lr} (out_ch {out_ch}) <- {sources}")
+                    else:
+                        dbg(f"  Track {t}.{lr} (out_ch {out_ch}) <- [silence]")
 
-            return self._start_multi_input_stream(input_devices, output_idx, rate)
+            return self._start_multi_input_stream(input_devices, output_devices, rate)
 
         except Exception as e:
             print(f"Error in audio routing setup: {e}")
             return False
 
-    def _start_multi_input_stream(self, input_devices, output_idx, rate):
-        """Open input streams for each device, mix via output callback."""
+    def _start_multi_input_stream(self, input_devices, output_devices, rate):
+        """Open input streams for each device, mix via per-output callbacks."""
         try:
+            num_inputs = len(input_devices)
+            num_outputs = len(output_devices)
+
             self.debug_counter = 0
-            self.input_raw_data = [None] * len(input_devices)
-            # Ring buffers decouple input/output hardware clocks — input pushes, output pops
-            # maxlen=4 gives ~80ms of jitter absorption at 1024/48kHz
-            self._input_ringbufs = [deque(maxlen=4) for _ in range(len(input_devices))]
-            self._prev_output = None  # for fade-out on underrun
+            self.input_raw_data = [None] * num_inputs
+            # Per-output ring buffers — input callbacks broadcast to ALL sets,
+            # each output callback pops from its own set independently.
+            # maxlen=4 gives ~80ms of jitter absorption at 1024/48kHz.
+            self._output_ringbufs = [
+                [deque(maxlen=4) for _ in range(num_inputs)]
+                for _ in range(num_outputs)
+            ]
+            self._prev_outputs = [None] * num_outputs  # per-output fade-out
             self._diag_stale_reads = 0
+            self._diag_input_peaks = [0.0] * num_inputs  # per-input peak tracking
 
             # Open diagnostics log file (only when DEBUG enabled)
             if DEBUG:
@@ -219,12 +270,13 @@ class AudioManager:
                 self._diag_file.write(f"=== LF MusicMapper Audio Diagnostics ===\n")
                 self._diag_file.write(f"Started: {datetime.datetime.now().isoformat()}\n")
                 self._diag_file.write(f"Sample rate: {rate} Hz | Buffer: {self.buffer_size} frames "
-                                      f"({self.buffer_size/rate*1000:.1f}ms) | Output channels: {self.num_output_channels}\n")
+                                      f"({self.buffer_size/rate*1000:.1f}ms)\n")
                 for i, dev in enumerate(input_devices):
                     info = self.pa.get_device_info_by_index(dev['index'])
                     self._diag_file.write(f"Input {chr(ord('A')+i)}: {info['name']} ({dev['channels']}ch)\n")
-                out_info = self.pa.get_device_info_by_index(output_idx)
-                self._diag_file.write(f"Output: {out_info['name']}\n")
+                for i, dev in enumerate(output_devices):
+                    info = self.pa.get_device_info_by_index(dev['index'])
+                    self._diag_file.write(f"Output {dev['label']}: {info['name']} ({dev['channels']}ch)\n")
                 self._diag_file.write(f"{'='*60}\n")
                 self._diag_file.flush()
                 print(f"Audio diagnostics logging to: {log_path}")
@@ -240,7 +292,159 @@ class AudioManager:
             self._diag_frame_mismatch = 0
             self._diag_buffer_time_ms = self.buffer_size / rate * 1000
 
-            # Create a callback closure for each input device
+            # Per-output duplex detection — each output independently checks
+            # if an input device shares the same physical device.  An input can
+            # only be duplex-paired with one output (first match wins).
+            # Two cases:
+            #   1. Same PortAudio index (single-entry device like Volt 476)
+            #   2. Split device — same name but different indices (e.g. macOS
+            #      enumerates the S-4 as separate input-only and output-only
+            #      entries; opening them independently causes CoreAudio to
+            #      never activate the USB return path → input is all zeros).
+            # _duplex_pairs: {out_idx: (in_dev_idx, in_channels,
+            #                           stream_channels, input_pa_idx)}
+            _duplex_pairs = {}
+            _claimed_inputs = set()
+            for oi, odev in enumerate(output_devices):
+                out_name = self.pa.get_device_info_by_index(odev['index'])['name']
+                for di, idev in enumerate(input_devices):
+                    if di in _claimed_inputs:
+                        continue
+                    in_name = self.pa.get_device_info_by_index(idev['index'])['name']
+                    if idev['index'] == odev['index'] or in_name == out_name:
+                        out_info = self.pa.get_device_info_by_index(odev['index'])
+                        stream_ch = max(
+                            idev['channels'],
+                            int(out_info['maxOutputChannels']),
+                            odev['channels'],
+                        )
+                        _duplex_pairs[oi] = (di, idev['channels'], stream_ch, idev['index'])
+                        _claimed_inputs.add(di)
+                        if idev['index'] == odev['index']:
+                            dbg(f"Full-duplex: Input {chr(ord('A') + di)} shares "
+                                f"device index with Output {odev['label']} "
+                                f"(channels={stream_ch})")
+                        else:
+                            dbg(f"Full-duplex (split device): Input "
+                                f"{chr(ord('A') + di)} '{in_name}' "
+                                f"(idx={idev['index']}) paired with Output "
+                                f"{odev['label']} '{out_name}' "
+                                f"(idx={odev['index']}), "
+                                f"stream channels={stream_ch}")
+                        break
+
+            # For split devices on macOS, create CoreAudio aggregate devices
+            # to properly co-activate both USB data paths.  PortAudio's own
+            # internal aggregate (via different input/output device indices)
+            # doesn't reliably activate the USB return on some interfaces.
+            _need_pa_reinit = False
+            if _HAS_COREAUDIO_AGG:
+                # Save device names before any potential PyAudio re-init
+                _saved_in_names = {}
+                for _si, _sd in enumerate(input_devices):
+                    _saved_in_names[_si] = self.pa.get_device_info_by_index(
+                        _sd['index'])['name']
+                _saved_out_names = {}
+                for _si, _sd in enumerate(output_devices):
+                    _saved_out_names[_si] = self.pa.get_device_info_by_index(
+                        _sd['index'])['name']
+
+                for oi in list(_duplex_pairs.keys()):
+                    di, in_ch, stream_ch, in_pa_idx = _duplex_pairs[oi]
+                    if in_pa_idx == output_devices[oi]['index']:
+                        continue  # same index — no split, no aggregate needed
+                    out_name = _saved_out_names[oi]
+                    dbg(f"Creating CoreAudio aggregate for Output "
+                        f"{output_devices[oi]['label']} split device...")
+
+                    uids = get_uids_for_device_name(out_name)
+                    dbg(f"  CoreAudio UIDs for '{out_name}': {uids}")
+
+                    if len(uids) >= 2:
+                        master_uid = None
+                        all_uids = []
+                        for _uid, _, _has_out in uids:
+                            all_uids.append(_uid)
+                            if _has_out:
+                                master_uid = _uid
+
+                        if master_uid and len(all_uids) >= 2:
+                            agg_id = create_aggregate_device(
+                                all_uids, master_uid=master_uid)
+                            if agg_id:
+                                self._aggregate_device_ids.append(agg_id)
+                                _need_pa_reinit = True
+                                dbg(f"  Aggregate created "
+                                    f"(AudioDeviceID={agg_id})")
+                            else:
+                                dbg("  WARNING: CoreAudio aggregate "
+                                    "creation failed")
+                        else:
+                            dbg(f"  WARNING: could not identify output UID "
+                                f"from {uids}")
+                    else:
+                        dbg(f"  WARNING: expected 2+ CoreAudio devices for "
+                            f"'{out_name}', found {len(uids)}")
+
+            # Re-init PyAudio once if any aggregates were created
+            if _need_pa_reinit:
+                self.pa.terminate()
+                self.pa = pyaudio.PyAudio()
+
+                # Re-resolve all device indices by name
+                for _si, _sd in enumerate(input_devices):
+                    _target = _saved_in_names[_si]
+                    for _pi in range(self.pa.get_device_count()):
+                        _pinfo = self.pa.get_device_info_by_index(_pi)
+                        if (_pinfo['name'] == _target
+                                and _pinfo['maxInputChannels']
+                                >= _sd['channels']):
+                            _sd['index'] = _pi
+                            break
+
+                for _si, _sd in enumerate(output_devices):
+                    _target = _saved_out_names[_si]
+                    for _pi in range(self.pa.get_device_count()):
+                        _pinfo = self.pa.get_device_info_by_index(_pi)
+                        if (_pinfo['name'] == _target
+                                and _pinfo['maxOutputChannels']
+                                >= _sd['channels']):
+                            _sd['index'] = _pi
+                            break
+
+                # Find aggregate devices and update duplex pairs
+                for oi in list(_duplex_pairs.keys()):
+                    di, in_ch, stream_ch, in_pa_idx = _duplex_pairs[oi]
+                    if in_pa_idx == output_devices[oi]['index']:
+                        continue  # was same-index, not a split device
+                    # Look for the aggregate in the refreshed device list
+                    _agg_pa_idx = None
+                    for _pi in range(self.pa.get_device_count()):
+                        _pinfo = self.pa.get_device_info_by_index(_pi)
+                        if AGG_DEVICE_NAME in _pinfo['name']:
+                            _agg_pa_idx = _pi
+                            break
+
+                    if _agg_pa_idx is not None:
+                        _agg_info = self.pa.get_device_info_by_index(
+                            _agg_pa_idx)
+                        dbg(f"  Aggregate at PA idx {_agg_pa_idx}: "
+                            f"in={_agg_info['maxInputChannels']} "
+                            f"out={_agg_info['maxOutputChannels']}")
+                        # Use separate streams on aggregate instead of
+                        # full-duplex (avoids all-zero input on some)
+                        output_devices[oi]['index'] = _agg_pa_idx
+                        input_devices[di]['index'] = _agg_pa_idx
+                        input_devices[di]['channels'] = int(
+                            _agg_info['maxInputChannels'])
+                        del _duplex_pairs[oi]  # clear duplex flag
+                    else:
+                        dbg("  WARNING: aggregate not found in "
+                            "PyAudio after re-init")
+
+            # Create a callback closure for each input device.
+            # Each input broadcasts its buffer to ALL output ring buffer sets
+            # so each output callback can independently consume data.
             def make_input_callback(dev_idx, num_channels):
                 def callback(in_data, frame_count, time_info, status):
                     if status:
@@ -250,8 +454,14 @@ class AudioManager:
                     if len(data) > 0 and num_channels > 0:
                         try:
                             buf = data.reshape(-1, num_channels).copy()
-                            self._input_ringbufs[dev_idx].append(buf)
+                            # Broadcast to every output's ring buffer set
+                            for out_bufs in self._output_ringbufs:
+                                out_bufs[dev_idx].append(buf)
                             self.input_raw_data[dev_idx] = buf  # latest ref for viz
+                            # Per-input peak tracking
+                            peak = float(np.abs(buf).max())
+                            if peak > self._diag_input_peaks[dev_idx]:
+                                self._diag_input_peaks[dev_idx] = peak
                         except Exception:
                             pass
                     return (None, pyaudio.paContinue)
@@ -260,159 +470,209 @@ class AudioManager:
             # Crossfade ramp — precomputed for underrun fade-out
             _xfade_out = np.linspace(1.0, 0.0, self.buffer_size, dtype=np.float32).reshape(-1, 1)
 
-            # Output callback: pop fresh buffers from ring buffers, mix, and output.
-            # Ring buffers absorb clock drift between input and output devices.
-            def output_callback(in_data, frame_count, time_info, status):
-                cb_start = time.time()
-                try:
-                    self._diag_cb_count += 1
+            # Collect which input indices are claimed by any duplex pair
+            _duplex_input_idxs = {info[0] for info in _duplex_pairs.values()}
 
-                    # Track PortAudio status flags
-                    if status:
-                        if status & pyaudio.paOutputUnderflow:
-                            self._diag_underruns += 1
-                        if status & pyaudio.paOutputOverflow:
-                            self._diag_overruns += 1
+            # Output callback factory — one closure per output device.
+            # Each captures its own out_idx, channel count, and ring buffer set.
+            def make_output_callback(out_idx, out_channels):
+                # Duplex info for this output (if any)
+                _dup = _duplex_pairs.get(out_idx)  # (in_dev_idx, in_ch, stream_ch, in_pa_idx) or None
+                _stream_channels = _dup[2] if _dup else out_channels
 
-                    if frame_count != self.buffer_size:
-                        self._diag_frame_mismatch += 1
+                def output_callback(in_data, frame_count, time_info, status):
+                    cb_start = time.time()
+                    try:
+                        self._diag_cb_count += 1
 
-                    # Pop fresh data from each input's ring buffer
-                    has_data = False
-                    input_bufs = [None] * len(self.input_channel_counts)
-                    for i in range(len(self.input_channel_counts)):
-                        rb = self._input_ringbufs[i]
-                        if rb:
-                            input_bufs[i] = rb.popleft()
-                            has_data = True
-                        else:
-                            # Underrun on this input — no fresh data available
-                            self._diag_stale_reads += 1
+                        # Track PortAudio status flags
+                        if status:
+                            if status & pyaudio.paOutputUnderflow:
+                                self._diag_underruns += 1
+                            if status & pyaudio.paOutputOverflow:
+                                self._diag_overruns += 1
 
-                    if not has_data:
-                        self._diag_no_data += 1
-                        # Fade out previous output to avoid hard cut to silence
-                        if self._prev_output is not None:
-                            xf_len = min(frame_count, len(_xfade_out))
-                            faded = self._prev_output[:xf_len] * _xfade_out[:xf_len]
-                            self._prev_output = None
-                            return (faded.flatten().tobytes(), pyaudio.paContinue)
-                        silence = np.zeros(frame_count * self.num_output_channels, dtype=np.float32)
+                        # Full-duplex: capture input from the shared device
+                        if _dup is not None and in_data is not None:
+                            dup_dev_idx, dup_in_ch, dup_stream_ch, _ = _dup
+                            try:
+                                dup_data = np.frombuffer(in_data, dtype=np.float32)
+                                if len(dup_data) > 0:
+                                    dup_buf = dup_data.reshape(-1, dup_stream_ch).copy()
+                                    if dup_in_ch < dup_stream_ch:
+                                        dup_buf = dup_buf[:, :dup_in_ch]
+                                    # Broadcast to ALL output ring buffer sets
+                                    for obufs in self._output_ringbufs:
+                                        obufs[dup_dev_idx].append(dup_buf)
+                                    self.input_raw_data[dup_dev_idx] = dup_buf
+                                    dup_peak = float(np.abs(dup_buf).max())
+                                    if dup_peak > self._diag_input_peaks[dup_dev_idx]:
+                                        self._diag_input_peaks[dup_dev_idx] = dup_peak
+                            except Exception:
+                                pass
+                        elif _dup is not None and in_data is None:
+                            self._diag_no_data += 1
+
+                        if frame_count != self.buffer_size:
+                            self._diag_frame_mismatch += 1
+
+                        # Pop fresh data from THIS output's ring buffer set
+                        has_data = False
+                        input_bufs = [None] * len(self.input_channel_counts)
+                        for i in range(len(self.input_channel_counts)):
+                            rb = self._output_ringbufs[out_idx][i]
+                            if rb:
+                                input_bufs[i] = rb.popleft()
+                                has_data = True
+                            else:
+                                self._diag_stale_reads += 1
+
+                        if not has_data:
+                            self._diag_no_data += 1
+                            # Fade out previous output to avoid hard cut to silence
+                            prev = self._prev_outputs[out_idx]
+                            if prev is not None:
+                                xf_len = min(frame_count, len(_xfade_out))
+                                faded = prev[:xf_len] * _xfade_out[:xf_len]
+                                self._prev_outputs[out_idx] = None
+                                return (faded.flatten().tobytes(), pyaudio.paContinue)
+                            silence = np.zeros(frame_count * _stream_channels, dtype=np.float32)
+                            return (silence.tobytes(), pyaudio.paContinue)
+
+                        # Build combined input array (frames x total_channels)
+                        combined = np.zeros((frame_count, self.total_input_channels), dtype=np.float32)
+                        ch_offset = 0
+                        for i in range(len(self.input_channel_counts)):
+                            num_ch = self.input_channel_counts[i]
+                            raw = input_bufs[i]
+                            if raw is not None:
+                                use_frames = min(frame_count, len(raw))
+                                use_ch = min(num_ch, raw.shape[1]) if len(raw.shape) > 1 else num_ch
+                                combined[:use_frames, ch_offset:ch_offset + use_ch] = raw[:use_frames, :use_ch]
+                            ch_offset += num_ch
+
+                        # Apply THIS output's track mapping
+                        mapping = self.track_mappings[out_idx] if out_idx < len(self.track_mappings) else []
+                        output_frames = np.zeros((frame_count, out_channels), dtype=np.float32)
+                        for out_ch in range(out_channels):
+                            mapping_entry = []
+                            if out_ch < len(mapping):
+                                mapping_entry = mapping[out_ch]
+                            if isinstance(mapping_entry, dict):
+                                mapping_entry = [mapping_entry]
+                            elif not isinstance(mapping_entry, (list, tuple)):
+                                mapping_entry = []
+
+                            valid_entries = []
+                            for entry in mapping_entry:
+                                idx = entry.get('index') if isinstance(entry, dict) else None
+                                gain = entry.get('gain', 1.0) if isinstance(entry, dict) else 1.0
+                                if isinstance(idx, int) and 0 <= idx < self.total_input_channels:
+                                    valid_entries.append({'index': idx, 'gain': max(0.0, float(gain))})
+
+                            total_gain = sum(item['gain'] for item in valid_entries)
+                            if total_gain > 0:
+                                mixed = np.zeros(frame_count, dtype=np.float32)
+                                for item in valid_entries:
+                                    mixed += combined[:, item['index']] * item['gain']
+                                mixed /= total_gain
+                                output_frames[:, out_ch] = mixed
+
+                        # Soft-clip output to prevent popping from hot signals
+                        output_frames = np.tanh(output_frames)
+
+                        # Pad output for full-duplex stream (more device channels
+                        # than routed output channels)
+                        if _stream_channels > out_channels:
+                            padded = np.zeros((frame_count, _stream_channels), dtype=np.float32)
+                            padded[:, :out_channels] = output_frames
+                            output_frames = padded
+
+                        # Save for fade-out on future underrun
+                        self._prev_outputs[out_idx] = output_frames.copy()
+
+                        # Update visualization only from the viz output
+                        if out_idx == self.viz_output_idx:
+                            peak = float(np.abs(output_frames).max())
+                            if peak > self._diag_peak:
+                                self._diag_peak = peak
+
+                            self.channel_levels = [
+                                np.abs(output_frames[:, ch]).mean() if ch < out_channels else 0.0
+                                for ch in range(8)
+                            ]
+                            sample_count = min(self.buffer_size, len(output_frames))
+                            for ch in range(min(8, out_channels)):
+                                if sample_count > 0:
+                                    self.audio_data[:sample_count, ch] = output_frames[:sample_count, ch]
+                                    if sample_count < self.buffer_size:
+                                        self.audio_data[sample_count:, ch] = 0
+
+                        result = (output_frames.flatten().tobytes(), pyaudio.paContinue)
+
+                        # Track callback duration
+                        cb_ms = (time.time() - cb_start) * 1000
+                        if cb_ms > self._diag_cb_max_ms:
+                            self._diag_cb_max_ms = cb_ms
+                        if cb_ms > self._diag_buffer_time_ms * 0.5:
+                            self._diag_slow_cb += 1
+
+                        # Diagnostics every 2s (only from output 0 to avoid dupes)
+                        if out_idx == 0:
+                            now = time.time()
+                            if now - self._diag_last_report >= 2.0 and self._diag_file:
+                                elapsed = now - self._diag_last_report
+                                cbs = self._diag_cb_count
+                                cb_rate = cbs / elapsed if elapsed > 0 else 0
+                                input_peak_str = " ".join(
+                                    f"{chr(ord('A')+i)}={p:.4f}"
+                                    for i, p in enumerate(self._diag_input_peaks)
+                                )
+                                self._diag_file.write(
+                                    f"[{now:.1f}] callbacks={cbs} ({cb_rate:.0f}/s) | "
+                                    f"underruns={self._diag_underruns} overruns={self._diag_overruns} | "
+                                    f"no_data={self._diag_no_data} stale={self._diag_stale_reads} "
+                                    f"frame_mismatch={self._diag_frame_mismatch} | "
+                                    f"slow_cb(>{self._diag_buffer_time_ms*0.5:.1f}ms)={self._diag_slow_cb} "
+                                    f"max_cb={self._diag_cb_max_ms:.2f}ms | "
+                                    f"out_peak={self._diag_peak:.4f} | "
+                                    f"in_peaks: {input_peak_str} | "
+                                    f"exceptions={self._diag_exceptions}\n"
+                                )
+                                self._diag_file.flush()
+                                self._diag_last_report = now
+                                self._diag_cb_count = 0
+                                self._diag_underruns = 0
+                                self._diag_overruns = 0
+                                self._diag_no_data = 0
+                                self._diag_stale_reads = 0
+                                self._diag_slow_cb = 0
+                                self._diag_cb_max_ms = 0.0
+                                self._diag_peak = 0.0
+                                self._diag_frame_mismatch = 0
+                                self._diag_exceptions = 0
+                                self._diag_input_peaks = [0.0] * len(self._diag_input_peaks)
+
+                        return result
+
+                    except Exception as e:
+                        self._diag_exceptions += 1
+                        if self._diag_file:
+                            self._diag_file.write(f"!!! EXCEPTION in output_callback[{out_idx}]: {e}\n")
+                            self._diag_file.flush()
+                        silence = np.zeros(frame_count * _stream_channels, dtype=np.float32)
                         return (silence.tobytes(), pyaudio.paContinue)
 
-                    # Build combined input array (frames x total_channels)
-                    combined = np.zeros((frame_count, self.total_input_channels), dtype=np.float32)
-                    ch_offset = 0
-                    for i in range(len(self.input_channel_counts)):
-                        num_ch = self.input_channel_counts[i]
-                        raw = input_bufs[i]
-                        if raw is not None:
-                            use_frames = min(frame_count, len(raw))
-                            use_ch = min(num_ch, raw.shape[1]) if len(raw.shape) > 1 else num_ch
-                            combined[:use_frames, ch_offset:ch_offset + use_ch] = raw[:use_frames, :use_ch]
-                        ch_offset += num_ch
+                return output_callback
 
-                    # Apply the channel mapping
-                    output_frames = np.zeros((frame_count, self.num_output_channels), dtype=np.float32)
-                    for out_ch in range(self.num_output_channels):
-                        mapping_entry = []
-                        if out_ch < len(self.track_mapping):
-                            mapping_entry = self.track_mapping[out_ch]
-                        if isinstance(mapping_entry, dict):
-                            mapping_entry = [mapping_entry]
-                        elif not isinstance(mapping_entry, (list, tuple)):
-                            mapping_entry = []
-
-                        valid_entries = []
-                        for entry in mapping_entry:
-                            idx = entry.get('index') if isinstance(entry, dict) else None
-                            gain = entry.get('gain', 1.0) if isinstance(entry, dict) else 1.0
-                            if isinstance(idx, int) and 0 <= idx < self.total_input_channels:
-                                valid_entries.append({'index': idx, 'gain': max(0.0, float(gain))})
-
-                        total_gain = sum(item['gain'] for item in valid_entries)
-                        if total_gain > 0:
-                            mixed = np.zeros(frame_count, dtype=np.float32)
-                            for item in valid_entries:
-                                mixed += combined[:, item['index']] * item['gain']
-                            mixed /= total_gain
-                            output_frames[:, out_ch] = mixed
-
-                    # Soft-clip output to prevent popping from hot signals
-                    output_frames = np.tanh(output_frames)
-
-                    # Save for fade-out on future underrun
-                    self._prev_output = output_frames.copy()
-
-                    # Track peak level
-                    peak = float(np.abs(output_frames).max())
-                    if peak > self._diag_peak:
-                        self._diag_peak = peak
-
-                    # Update visualization data
-                    self.channel_levels = [
-                        np.abs(output_frames[:, ch]).mean() if ch < self.num_output_channels else 0.0
-                        for ch in range(8)
-                    ]
-                    sample_count = min(self.buffer_size, len(output_frames))
-                    for ch in range(min(8, self.num_output_channels)):
-                        if sample_count > 0:
-                            self.audio_data[:sample_count, ch] = output_frames[:sample_count, ch]
-                            if sample_count < self.buffer_size:
-                                self.audio_data[sample_count:, ch] = 0
-
-                    result = (output_frames.flatten().tobytes(), pyaudio.paContinue)
-
-                    # Track callback duration
-                    cb_ms = (time.time() - cb_start) * 1000
-                    if cb_ms > self._diag_cb_max_ms:
-                        self._diag_cb_max_ms = cb_ms
-                    if cb_ms > self._diag_buffer_time_ms * 0.5:
-                        self._diag_slow_cb += 1
-
-                    # Write diagnostic summary every 2 seconds (DEBUG only)
-                    now = time.time()
-                    if now - self._diag_last_report >= 2.0 and self._diag_file:
-                        elapsed = now - self._diag_last_report
-                        cbs = self._diag_cb_count
-                        cb_rate = cbs / elapsed if elapsed > 0 else 0
-                        self._diag_file.write(
-                            f"[{now:.1f}] callbacks={cbs} ({cb_rate:.0f}/s) | "
-                            f"underruns={self._diag_underruns} overruns={self._diag_overruns} | "
-                            f"no_data={self._diag_no_data} stale={self._diag_stale_reads} "
-                            f"frame_mismatch={self._diag_frame_mismatch} | "
-                            f"slow_cb(>{self._diag_buffer_time_ms*0.5:.1f}ms)={self._diag_slow_cb} "
-                            f"max_cb={self._diag_cb_max_ms:.2f}ms | "
-                            f"peak={self._diag_peak:.4f} | "
-                            f"exceptions={self._diag_exceptions}\n"
-                        )
-                        self._diag_file.flush()
-                        # Reset counters for next period
-                        self._diag_last_report = now
-                        self._diag_cb_count = 0
-                        self._diag_underruns = 0
-                        self._diag_overruns = 0
-                        self._diag_no_data = 0
-                        self._diag_stale_reads = 0
-                        self._diag_slow_cb = 0
-                        self._diag_cb_max_ms = 0.0
-                        self._diag_peak = 0.0
-                        self._diag_frame_mismatch = 0
-                        self._diag_exceptions = 0
-
-                    return result
-
-                except Exception as e:
-                    self._diag_exceptions += 1
-                    if self._diag_file:
-                        self._diag_file.write(f"!!! EXCEPTION in callback: {e}\n")
-                        self._diag_file.flush()
-                    silence = np.zeros(frame_count * self.num_output_channels, dtype=np.float32)
-                    return (silence.tobytes(), pyaudio.paContinue)
-
-            # Open one input stream per device
+            # Open one input stream per device (skip duplex-paired inputs)
             self.input_streams = []
             for dev_idx, dev in enumerate(input_devices):
+                if dev_idx in _duplex_input_idxs:
+                    dbg(f"Skipping separate input stream for "
+                        f"{chr(ord('A') + dev_idx)} (full-duplex)")
+                    self.input_streams.append(None)  # placeholder
+                    continue
                 label = chr(ord('A') + dev_idx)
                 dbg(f"Opening input stream {label} with {dev['channels']} channels at {rate}Hz, buffer={self.buffer_size}")
                 stream = self.pa.open(
@@ -426,20 +686,45 @@ class AudioManager:
                 )
                 self.input_streams.append(stream)
 
-            # Open output stream with callback (driven by audio clock)
-            dbg(f"Opening output stream with {self.num_output_channels} channels at {rate}Hz, buffer={self.buffer_size}")
-            self.output_stream = self.pa.open(
-                format=pyaudio.paFloat32,
-                channels=self.num_output_channels,
-                rate=rate,
-                output=True,
-                output_device_index=output_idx,
-                frames_per_buffer=self.buffer_size,
-                stream_callback=output_callback
-            )
+            # Open output streams — one per output device.
+            # Full-duplex when an input shares the device.
+            self.output_streams = []
+            for oi, odev in enumerate(output_devices):
+                cb = make_output_callback(oi, odev['channels'])
+                if oi in _duplex_pairs:
+                    di, in_ch, stream_ch, in_pa_idx = _duplex_pairs[oi]
+                    dbg(f"Opening FULL-DUPLEX stream for Output {odev['label']}: "
+                        f"in_idx={in_pa_idx} out_idx={odev['index']} "
+                        f"channels={stream_ch} rate={rate}Hz")
+                    stream = self.pa.open(
+                        format=pyaudio.paFloat32,
+                        channels=stream_ch,
+                        rate=rate,
+                        input=True,
+                        output=True,
+                        input_device_index=in_pa_idx,
+                        output_device_index=odev['index'],
+                        frames_per_buffer=self.buffer_size,
+                        stream_callback=cb
+                    )
+                else:
+                    dbg(f"Opening output stream {odev['label']} with "
+                        f"{odev['channels']} channels at {rate}Hz, "
+                        f"buffer={self.buffer_size}")
+                    stream = self.pa.open(
+                        format=pyaudio.paFloat32,
+                        channels=odev['channels'],
+                        rate=rate,
+                        output=True,
+                        output_device_index=odev['index'],
+                        frames_per_buffer=self.buffer_size,
+                        stream_callback=cb
+                    )
+                self.output_streams.append(stream)
 
             self.is_routing = True
-            dbg(f"\nStarted routing with {len(input_devices)} input device(s)")
+            dbg(f"\nStarted routing with {len(input_devices)} input(s), "
+                f"{len(output_devices)} output(s)")
             return True
 
         except Exception as e:
@@ -462,8 +747,10 @@ class AudioManager:
         # Brief pause to let the callback emit at least one silent buffer
         time.sleep(0.05)
 
-        # Close all input streams
+        # Close all input streams (None entries are duplex placeholders)
         for i, stream in enumerate(self.input_streams):
+            if stream is None:
+                continue
             try:
                 if stream.is_active():
                     stream.stop_stream()
@@ -473,16 +760,28 @@ class AudioManager:
                 dbg(f"Error closing input stream {chr(ord('A') + i)}: {e}")
         self.input_streams = []
 
-        # Close output stream
-        if self.output_stream:
+        # Close all output streams
+        for i, stream in enumerate(self.output_streams):
+            if stream is None:
+                continue
             try:
-                if self.output_stream.is_active():
-                    self.output_stream.stop_stream()
-                self.output_stream.close()
-                dbg("Output stream closed")
+                if stream.is_active():
+                    stream.stop_stream()
+                stream.close()
+                dbg(f"Output stream {i} closed")
             except Exception as e:
-                dbg(f"Error closing output stream: {e}")
-            self.output_stream = None
+                dbg(f"Error closing output stream {i}: {e}")
+        self.output_streams = []
+
+        # Destroy CoreAudio aggregate devices (macOS only)
+        if self._aggregate_device_ids and _HAS_COREAUDIO_AGG:
+            for agg_id in self._aggregate_device_ids:
+                try:
+                    destroy_aggregate_device(agg_id)
+                    dbg(f"CoreAudio aggregate {agg_id} destroyed")
+                except Exception as e:
+                    dbg(f"Error destroying aggregate {agg_id}: {e}")
+            self._aggregate_device_ids = []
 
         # Close diagnostics log
         if self._diag_file:
@@ -505,6 +804,14 @@ class AudioManager:
     def cleanup(self):
         """Clean up resources"""
         self.stop_routing()
+        # Safety net: destroy aggregates if stop_routing didn't
+        if self._aggregate_device_ids and _HAS_COREAUDIO_AGG:
+            for agg_id in self._aggregate_device_ids:
+                try:
+                    destroy_aggregate_device(agg_id)
+                except Exception:
+                    pass
+            self._aggregate_device_ids = []
         self.pa.terminate()
         dbg("Audio resources cleaned up")
 
@@ -862,14 +1169,26 @@ class TrackMapperWidget(QtWidgets.QWidget):
                 dev_label = info['label']
                 dev_channels = info['channels']
                 if dev_channels >= 2:
-                    # Stereo button for this device
-                    btn = QtWidgets.QPushButton(f"{dev_label} Stereo")
-                    btn.setToolTip(f"Set track to stereo ({dev_label}1->L, {dev_label}2->R)")
-                    btn.setProperty("preset", "true")
-                    left_idx = ch_offset
-                    right_idx = ch_offset + 1
-                    btn.clicked.connect(lambda checked, t=track_idx, l=left_idx, r=right_idx: self._set_stereo_pair(t, l, r))
-                    layout.addWidget(btn)
+                    # Stereo pair buttons — one per pair of channels.
+                    # 2-channel device: "B Stereo"
+                    # 4-channel device: "B 1-2" (e.g. Dry) and "B 3-4" (e.g. Wet/FX)
+                    num_pairs = dev_channels // 2
+                    for pair_idx in range(num_pairs):
+                        left_idx = ch_offset + pair_idx * 2
+                        right_idx = left_idx + 1
+                        if num_pairs == 1:
+                            label_text = f"{dev_label} Stereo"
+                            tip = f"Set track to stereo ({dev_label}1->L, {dev_label}2->R)"
+                        else:
+                            ch_lo = pair_idx * 2 + 1
+                            ch_hi = ch_lo + 1
+                            label_text = f"{dev_label} {ch_lo}-{ch_hi}"
+                            tip = f"Set track to {dev_label}{ch_lo}->L, {dev_label}{ch_hi}->R"
+                        btn = QtWidgets.QPushButton(label_text)
+                        btn.setToolTip(tip)
+                        btn.setProperty("preset", "true")
+                        btn.clicked.connect(lambda checked, t=track_idx, l=left_idx, r=right_idx: self._set_stereo_pair(t, l, r))
+                        layout.addWidget(btn)
                 # Mono button for each channel of this device
                 for ch in range(dev_channels):
                     global_idx = ch_offset + ch
@@ -1624,13 +1943,14 @@ class MainWindow(QtWidgets.QMainWindow):
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(12)
         
-        # Device selection
+        # Device selection — symmetric inputs (left) and outputs (right)
         device_group = QtWidgets.QGroupBox("Audio Devices")
         device_layout = QtWidgets.QGridLayout()
         device_layout.setSpacing(10)
-        device_layout.setColumnStretch(1, 1)
-        device_layout.setColumnStretch(3, 1)
+        device_layout.setColumnStretch(1, 1)  # input combos
+        device_layout.setColumnStretch(3, 1)  # output combos
 
+        # -- Inputs (left) --
         # Input A (always active)
         input_a_label = QtWidgets.QLabel("Input A:")
         input_a_label.setStyleSheet("font-weight: bold; color: #4B9DE0;")
@@ -1639,7 +1959,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.input_combo_a.currentIndexChanged.connect(self.input_device_changed)
         device_layout.addWidget(self.input_combo_a, 0, 1)
 
-        # Input B (optional — select a device to enable, "Off" to disable)
+        # Input B (optional)
         input_b_label = QtWidgets.QLabel("Input B:")
         input_b_label.setStyleSheet("font-weight: bold; color: #50C878;")
         device_layout.addWidget(input_b_label, 1, 0)
@@ -1647,7 +1967,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.input_combo_b.currentIndexChanged.connect(self.input_device_changed)
         device_layout.addWidget(self.input_combo_b, 1, 1)
 
-        # Input C (optional — select a device to enable, "Off" to disable)
+        # Input C (optional)
         input_c_label = QtWidgets.QLabel("Input C:")
         input_c_label.setStyleSheet("font-weight: bold; color: #E6A23C;")
         device_layout.addWidget(input_c_label, 2, 0)
@@ -1655,56 +1975,84 @@ class MainWindow(QtWidgets.QMainWindow):
         self.input_combo_c.currentIndexChanged.connect(self.input_device_changed)
         device_layout.addWidget(self.input_combo_c, 2, 1)
 
-        # Output device (right column, top)
-        device_layout.addWidget(QtWidgets.QLabel("Output Device:"), 0, 2)
-        self.output_combo = QtWidgets.QComboBox()
-        self.output_combo.currentIndexChanged.connect(self.output_device_changed)
-        device_layout.addWidget(self.output_combo, 0, 3)
+        # -- Outputs (right) — same color scheme as inputs --
+        # Output A (always active)
+        out_a_label = QtWidgets.QLabel("Output A:")
+        out_a_label.setStyleSheet("font-weight: bold; color: #4B9DE0;")
+        device_layout.addWidget(out_a_label, 0, 2)
+        self.output_combo_a = QtWidgets.QComboBox()
+        self.output_combo_a.currentIndexChanged.connect(lambda: self.output_device_changed('A'))
+        device_layout.addWidget(self.output_combo_a, 0, 3)
+        self.channels_combo_a = QtWidgets.QComboBox()
+        device_layout.addWidget(self.channels_combo_a, 0, 4)
 
-        # Output channels (right column, middle)
-        device_layout.addWidget(QtWidgets.QLabel("Output Channels:"), 1, 2)
-        self.channels_combo = QtWidgets.QComboBox()
-        device_layout.addWidget(self.channels_combo, 1, 3)
+        # Output B (optional)
+        out_b_label = QtWidgets.QLabel("Output B:")
+        out_b_label.setStyleSheet("font-weight: bold; color: #50C878;")
+        device_layout.addWidget(out_b_label, 1, 2)
+        self.output_combo_b = QtWidgets.QComboBox()
+        self.output_combo_b.currentIndexChanged.connect(lambda: self.output_device_changed('B'))
+        device_layout.addWidget(self.output_combo_b, 1, 3)
+        self.channels_combo_b = QtWidgets.QComboBox()
+        device_layout.addWidget(self.channels_combo_b, 1, 4)
 
-        # Sample rate (right column, bottom)
-        device_layout.addWidget(QtWidgets.QLabel("Sample Rate:"), 2, 2)
-        self.sample_rate_combo = QtWidgets.QComboBox()
-        for rate_val, rate_label in [(44100, "44100 Hz"), (48000, "48000 Hz"), (96000, "96000 Hz")]:
-            self.sample_rate_combo.addItem(rate_label, rate_val)
-        self.sample_rate_combo.setCurrentIndex(1)  # Default to 48000 Hz
-        device_layout.addWidget(self.sample_rate_combo, 2, 3)
+        # Output C (optional)
+        out_c_label = QtWidgets.QLabel("Output C:")
+        out_c_label.setStyleSheet("font-weight: bold; color: #E6A23C;")
+        device_layout.addWidget(out_c_label, 2, 2)
+        self.output_combo_c = QtWidgets.QComboBox()
+        self.output_combo_c.currentIndexChanged.connect(lambda: self.output_device_changed('C'))
+        device_layout.addWidget(self.output_combo_c, 2, 3)
+        self.channels_combo_c = QtWidgets.QComboBox()
+        device_layout.addWidget(self.channels_combo_c, 2, 4)
 
-        # Add refresh button
+        # Bottom row: Refresh, Start, Sample Rate
         refresh_btn = QtWidgets.QPushButton("Refresh Devices")
         refresh_btn.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_BrowserReload))
         device_layout.addWidget(refresh_btn, 3, 0)
         refresh_btn.clicked.connect(self.refresh_devices)
 
-        # Add start/stop button
         self.route_btn = QtWidgets.QPushButton("Start Routing")
         self.route_btn.setObjectName("applyButton")
         self.route_btn.clicked.connect(self.toggle_routing)
         device_layout.addWidget(self.route_btn, 3, 1)
 
+        device_layout.addWidget(QtWidgets.QLabel("Sample Rate:"), 3, 2)
+        self.sample_rate_combo = QtWidgets.QComboBox()
+        for rate_val, rate_label in [(44100, "44100 Hz"), (48000, "48000 Hz"), (96000, "96000 Hz")]:
+            self.sample_rate_combo.addItem(rate_label, rate_val)
+        self.sample_rate_combo.setCurrentIndex(1)  # Default to 48000 Hz
+        device_layout.addWidget(self.sample_rate_combo, 3, 3)
+
         device_group.setLayout(device_layout)
         left_layout.addWidget(device_group)
         
-        # Track mapper widget with its own group box to keep controls tidy
+        # Per-output track mapping via tabs
         mapper_group = QtWidgets.QGroupBox("Track Routing")
         mapper_layout = QtWidgets.QVBoxLayout()
         mapper_layout.setContentsMargins(10, 10, 10, 10)
         mapper_layout.setSpacing(8)
-        
+
         mapper_hint = QtWidgets.QLabel(
-            "Assign which input feeds every left/right channel. Use presets for quick stereo or mono setups."
+            "Assign which input feeds every left/right channel per output. Use presets for quick stereo or mono setups."
         )
         mapper_hint.setStyleSheet("color: #BBBBBB; font-size: 12px;")
         mapper_hint.setWordWrap(True)
         mapper_layout.addWidget(mapper_hint)
-        
-        self.track_mapper = TrackMapperWidget()
-        self.track_mapper.mapping_changed.connect(self.apply_mapping)
-        mapper_layout.addWidget(self.track_mapper)
+
+        self.mapper_tabs = QtWidgets.QTabWidget()
+        self.track_mappers = {}  # 'A'/'B'/'C' -> TrackMapperWidget
+
+        # Output A mapper is always present
+        mapper_a = TrackMapperWidget()
+        mapper_a.mapping_changed.connect(lambda: self.apply_mapping(0))
+        self.track_mappers['A'] = mapper_a
+        self.mapper_tabs.addTab(mapper_a, "Output A")
+
+        # Backward compat: self.track_mapper points to the primary mapper
+        self.track_mapper = mapper_a
+
+        mapper_layout.addWidget(self.mapper_tabs)
         mapper_group.setLayout(mapper_layout)
         left_layout.addWidget(mapper_group)
         left_layout.addStretch()
@@ -1735,6 +2083,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Store the device map for looking up device info
         self.device_map = {}
         self._cached_input_devices = []
+        self._cached_output_devices = []
         self._updating_inputs = False  # Guard against re-entrant input_device_changed
 
         # Initialize
@@ -1819,6 +2168,21 @@ class MainWindow(QtWidgets.QMainWindow):
         return [{'index': info['index'], 'channels': info['channels']}
                 for info in self.get_input_infos()]
 
+    def get_enabled_output_devices(self):
+        """Get list of {'index': int, 'channels': int, 'label': str} for start_routing."""
+        devices = []
+        combos = [
+            ('A', self.output_combo_a, self.channels_combo_a),
+            ('B', self.output_combo_b, self.channels_combo_b),
+            ('C', self.output_combo_c, self.channels_combo_c),
+        ]
+        for label, dev_combo, ch_combo in combos:
+            dev_idx = dev_combo.currentData()
+            channels = ch_combo.currentData()
+            if dev_idx is not None and channels is not None:
+                devices.append({'index': dev_idx, 'channels': channels, 'label': label})
+        return devices
+
     def input_device_changed(self):
         """Handle input device change — recompute total channels across all enabled inputs."""
         if self._updating_inputs:
@@ -1834,11 +2198,12 @@ class MainWindow(QtWidgets.QMainWindow):
             # Update the default mapping in the audio manager
             self.audio_manager.update_default_mapping(total_channels)
 
-            # Update track mapper UI with device labels
-            self.track_mapper.update_for_inputs(input_infos)
+            # Update all active track mapper tabs with device labels
+            for slot, mapper in self.track_mappers.items():
+                mapper.update_for_inputs(input_infos)
 
-            # Auto-assign devices to tracks, respecting output track count
-            output_channels = self.channels_combo.currentData()
+            # Auto-assign devices to tracks on primary output mapper
+            output_channels = self.channels_combo_a.currentData()
             num_output_tracks = (output_channels // 2) if output_channels else 1
             self.track_mapper.auto_assign_devices(input_infos, num_output_tracks)
 
@@ -1862,8 +2227,8 @@ class MainWindow(QtWidgets.QMainWindow):
             right_data = self.audio_manager.get_audio_data(1)
             self.spectrogram_3d.update_audio_data(left_data, right_data)
 
-            # Get selected channel count
-            output_channels = self.channels_combo.currentData()
+            # Get selected channel count (primary output)
+            output_channels = self.channels_combo_a.currentData()
             tracks = output_channels // 2 if output_channels else 1
 
             # Update track status labels (only on state change to avoid layout churn)
@@ -1906,6 +2271,16 @@ class MainWindow(QtWidgets.QMainWindow):
             combo.addItem(f"{device['name']} ({device['inputs']}ch, {int(device['rate'])}Hz)", device['index'])
         combo.blockSignals(False)
 
+    def _populate_output_combo(self, combo, add_placeholder=False):
+        """Populate an output combo with available output devices."""
+        combo.blockSignals(True)
+        combo.clear()
+        if add_placeholder:
+            combo.addItem("-- Off --", None)
+        for device in self._cached_output_devices:
+            combo.addItem(f"{device['name']} ({device['outputs']}ch, {int(device['rate'])}Hz)", device['index'])
+        combo.blockSignals(False)
+
     def refresh_devices(self):
         """Refresh the device lists (reinitializes PyAudio to detect USB changes)"""
         # Reinitialize PyAudio so newly connected USB devices are detected
@@ -1919,6 +2294,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Store device information for later use
         self.device_map = {device['index']: device for device in devices}
         self._cached_input_devices = [d for d in devices if d['inputs'] > 0]
+        self._cached_output_devices = [d for d in devices if d['outputs'] > 0]
 
         # Populate Input A (no placeholder — always active)
         self._populate_input_combo(self.input_combo_a, add_placeholder=False)
@@ -1927,16 +2303,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._populate_input_combo(self.input_combo_b, add_placeholder=True)
         self._populate_input_combo(self.input_combo_c, add_placeholder=True)
 
-        # Populate output combo
-        self.output_combo.clear()
-        for device in devices:
-            if device['outputs'] > 0:
-                self.output_combo.addItem(f"{device['name']} ({device['outputs']}ch, {int(device['rate'])}Hz)", device['index'])
+        # Populate Output A (no placeholder — always active)
+        self._populate_output_combo(self.output_combo_a, add_placeholder=False)
 
-        # Auto-select S4 output device if found
-        for i in range(self.output_combo.count()):
-            if "S4" in self.output_combo.itemText(i) or "S-4" in self.output_combo.itemText(i):
-                self.output_combo.setCurrentIndex(i)
+        # Output B and C get "-- Off --" placeholder + device list
+        self._populate_output_combo(self.output_combo_b, add_placeholder=True)
+        self._populate_output_combo(self.output_combo_c, add_placeholder=True)
+
+        # Auto-select S4 on Output A if found
+        for i in range(self.output_combo_a.count()):
+            if "S4" in self.output_combo_a.itemText(i) or "S-4" in self.output_combo_a.itemText(i):
+                self.output_combo_a.setCurrentIndex(i)
                 break
 
         # Auto-select Digitakt on Input A if found
@@ -1945,8 +2322,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.input_combo_a.setCurrentIndex(i)
                 break
 
-        # Update the channel combo for initially selected output
-        self.output_device_changed()
+        # Update channel combos for initially selected outputs
+        self.output_device_changed('A')
+        self.output_device_changed('B')
+        self.output_device_changed('C')
 
         # Unblock and do a single update for the initial state
         self._updating_inputs = False
@@ -1954,37 +2333,69 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.statusBar().showMessage("Devices refreshed - select your input and output devices")
     
-    def output_device_changed(self):
+    def _get_output_combos(self, slot):
+        """Return (device_combo, channels_combo) for the given output slot."""
+        return {
+            'A': (self.output_combo_a, self.channels_combo_a),
+            'B': (self.output_combo_b, self.channels_combo_b),
+            'C': (self.output_combo_c, self.channels_combo_c),
+        }[slot]
+
+    def output_device_changed(self, slot='A'):
         """Update the channel options based on the selected output device"""
-        output_idx = self.output_combo.currentData()
-        
+        dev_combo, ch_combo = self._get_output_combos(slot)
+        output_idx = dev_combo.currentData()
+
         # Clear existing options
-        self.channels_combo.clear()
-        
-        if output_idx is not None and output_idx in self.device_map:
+        ch_combo.clear()
+
+        is_enabled = output_idx is not None and output_idx in self.device_map
+
+        if is_enabled:
             # Get max channels for the selected output device
             device = self.device_map[output_idx]
             max_channels = int(device['outputs'])
-            
+
             # Keep track of whether we support at least one stereo track
             has_stereo = False
-            
+
             # Add options in pairs for stereo tracks up to 8 channels
             for i in range(1, min(5, (max_channels // 2) + 1)):
                 channels = i * 2
-                self.channels_combo.addItem(f"{channels} channels ({i} tracks)", channels)
+                ch_combo.addItem(f"{channels} channels ({i} tracks)", channels)
                 has_stereo = True
-            
+
             # If no stereo options were added, add mono option
             if not has_stereo and max_channels > 0:
-                self.channels_combo.addItem(f"{max_channels} channel(s) (mono)", max_channels)
-            
+                ch_combo.addItem(f"{max_channels} channel(s) (mono)", max_channels)
+
             # Set default selection to maximum available
-            if self.channels_combo.count() > 0:
-                self.channels_combo.setCurrentIndex(self.channels_combo.count() - 1)
-                
-            # Update input selectors for the track mapper
-            self.input_device_changed()
+            if ch_combo.count() > 0:
+                ch_combo.setCurrentIndex(ch_combo.count() - 1)
+
+            # Update input selectors for the track mapper (only on primary output)
+            if slot == 'A':
+                self.input_device_changed()
+
+        # Manage per-output mapper tabs for B and C
+        if slot in ('B', 'C') and hasattr(self, 'mapper_tabs'):
+            if is_enabled and slot not in self.track_mappers:
+                # Add a new mapper tab for this output
+                mapper = TrackMapperWidget()
+                out_idx = {'B': 1, 'C': 2}[slot]
+                mapper.mapping_changed.connect(lambda oi=out_idx: self.apply_mapping(oi))
+                self.track_mappers[slot] = mapper
+                self.mapper_tabs.addTab(mapper, f"Output {slot}")
+                # Initialize with current input info
+                input_infos = self.get_input_infos()
+                if input_infos:
+                    mapper.update_for_inputs(input_infos)
+            elif not is_enabled and slot in self.track_mappers:
+                # Remove the mapper tab
+                mapper = self.track_mappers.pop(slot)
+                idx = self.mapper_tabs.indexOf(mapper)
+                if idx >= 0:
+                    self.mapper_tabs.removeTab(idx)
 
     
     def toggle_routing(self):
@@ -1999,30 +2410,39 @@ class MainWindow(QtWidgets.QMainWindow):
             self._updating_inputs = False
 
             # Enable device selectors
-            self.input_combo_a.setEnabled(True)
-            self.input_combo_b.setEnabled(True)
-            self.input_combo_c.setEnabled(True)
-            self.output_combo.setEnabled(True)
-            self.channels_combo.setEnabled(True)
-            self.sample_rate_combo.setEnabled(True)
+            for combo in [self.input_combo_a, self.input_combo_b, self.input_combo_c,
+                          self.output_combo_a, self.output_combo_b, self.output_combo_c,
+                          self.channels_combo_a, self.channels_combo_b, self.channels_combo_c,
+                          self.sample_rate_combo]:
+                combo.setEnabled(True)
         else:
-            # Collect enabled input devices
+            # Collect enabled devices
             input_devices = self.get_enabled_input_devices()
-            output_idx = self.output_combo.currentData()
+            output_devices = self.get_enabled_output_devices()
 
-            if not input_devices or output_idx is None:
-                self.statusBar().showMessage("Please select at least one input and an output device")
+            if not input_devices or not output_devices:
+                self.statusBar().showMessage("Please select at least one input and one output device")
                 return
 
-            # Get selected channel count and sample rate
-            output_channels = self.channels_combo.currentData()
+            # Duplicate output validation
+            seen_indices = set()
+            for od in output_devices:
+                if od['index'] in seen_indices:
+                    name = self.device_map.get(od['index'], {}).get('name', '?')
+                    self.statusBar().showMessage(
+                        f"Error: '{name}' selected for multiple outputs - each output must be a different device")
+                    return
+                seen_indices.add(od['index'])
+
             sample_rate = self.sample_rate_combo.currentData() or 48000
 
-            # Apply current mapping
-            self.apply_mapping()
+            # Apply all active output mappings
+            for oi, label in enumerate(['A', 'B', 'C']):
+                if label in self.track_mappers:
+                    self.apply_mapping(oi)
 
-            # Start routing with all enabled inputs
-            if self.audio_manager.start_routing(input_devices, output_idx, output_channels, sample_rate):
+            # Start routing with all enabled inputs and outputs
+            if self.audio_manager.start_routing(input_devices, output_devices, sample_rate=sample_rate):
                 self.route_btn.setText("Stop Routing")
                 self.route_btn.setStyleSheet("""
                     background-color: #B33A3A;
@@ -2033,32 +2453,36 @@ class MainWindow(QtWidgets.QMainWindow):
                 """)
 
                 # Disable all device selectors while routing
-                self.input_combo_a.setEnabled(False)
-                self.input_combo_b.setEnabled(False)
-                self.input_combo_c.setEnabled(False)
-                self.output_combo.setEnabled(False)
-                self.channels_combo.setEnabled(False)
-                self.sample_rate_combo.setEnabled(False)
+                for combo in [self.input_combo_a, self.input_combo_b, self.input_combo_c,
+                              self.output_combo_a, self.output_combo_b, self.output_combo_c,
+                              self.channels_combo_a, self.channels_combo_b, self.channels_combo_c,
+                              self.sample_rate_combo]:
+                    combo.setEnabled(False)
 
-                # Update UI elements for the current channel/track count
+                # Update UI elements for the primary output's channel/track count
+                output_channels = output_devices[0]['channels']
                 tracks = output_channels // 2
                 self.level_meters.set_channels(output_channels)
                 self.update_track_labels(tracks)
 
-                # Build status message with all input device names
+                # Build status message
                 input_infos = self.get_input_infos()
                 in_names = " + ".join(f"{info['label']}:{self.device_map[info['index']]['name']}" for info in input_infos)
-                out_name = self.output_combo.currentText().split(" (")[0]
-                self.statusBar().showMessage(f"Routing [{in_names}] -> {out_name} ({output_channels}ch, {tracks} tracks, {sample_rate}Hz 32-bit float)")
+                out_names = " + ".join(f"{od['label']}:{self.device_map[od['index']]['name']}" for od in output_devices if od['index'] in self.device_map)
+                self.statusBar().showMessage(
+                    f"Routing [{in_names}] -> [{out_names}] ({sample_rate}Hz 32-bit float)")
             else:
                 self.statusBar().showMessage("Failed to start audio routing - Check device settings")
     
-    def apply_mapping(self):
-        """Apply the current track mapping to the audio manager"""
-        # Get current mapping
-        mapping = self.track_mapper.get_mapping()
-        
-        # Display the mapping in status bar
+    def apply_mapping(self, output_idx=0):
+        """Apply the current track mapping to the audio manager for a specific output."""
+        label = ['A', 'B', 'C'][output_idx] if output_idx < 3 else 'A'
+        mapper = self.track_mappers.get(label)
+        if mapper is None:
+            return
+
+        mapping = mapper.get_mapping()
+
         def describe(entry):
             if isinstance(entry, dict):
                 entry = [entry]
@@ -2081,13 +2505,13 @@ class MainWindow(QtWidgets.QMainWindow):
         mapping_str = ", ".join([
             f"{i//2+1}.{i%2+1}→{describe(m)}" for i, m in enumerate(mapping)
         ])
-        self.statusBar().showMessage(f"Applied mapping: {mapping_str}")
-        
+        self.statusBar().showMessage(f"Output {label} mapping: {mapping_str}")
+
         # Apply to audio manager
-        self.audio_manager.set_track_mapping(mapping)
-        
+        self.audio_manager.set_track_mapping(mapping, output_idx)
+
         # Update the track mapper status
-        self.track_mapper.status_label.setText(f"Mapping applied: {mapping_str}")
+        mapper.status_label.setText(f"Mapping applied: {mapping_str}")
     
     def closeEvent(self, event):
         """Handle window close event — stop visualization before audio cleanup."""
