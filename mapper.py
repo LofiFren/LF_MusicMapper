@@ -25,7 +25,7 @@ if sys.platform == 'darwin':
     except Exception:
         pass
 
-DEBUG = True
+DEBUG = False
 
 def dbg(*args, **kwargs):
     """Print only when DEBUG is enabled."""
