@@ -494,6 +494,7 @@ class AudioManager:
                                 self._diag_overruns += 1
 
                         # Full-duplex: capture input from the shared device
+                        _dup_buf_local = None
                         if _dup is not None and in_data is not None:
                             dup_dev_idx, dup_in_ch, dup_stream_ch, _ = _dup
                             try:
@@ -502,9 +503,12 @@ class AudioManager:
                                     dup_buf = dup_data.reshape(-1, dup_stream_ch).copy()
                                     if dup_in_ch < dup_stream_ch:
                                         dup_buf = dup_buf[:, :dup_in_ch]
-                                    # Broadcast to ALL output ring buffer sets
-                                    for obufs in self._output_ringbufs:
-                                        obufs[dup_dev_idx].append(dup_buf)
+                                    _dup_buf_local = (dup_dev_idx, dup_buf)
+                                    # Broadcast to OTHER outputs' ring buffer sets
+                                    # (skip our own — we use _dup_buf_local directly)
+                                    for oi_rb, obufs in enumerate(self._output_ringbufs):
+                                        if oi_rb != out_idx:
+                                            obufs[dup_dev_idx].append(dup_buf)
                                     self.input_raw_data[dup_dev_idx] = dup_buf
                                     dup_peak = float(np.abs(dup_buf).max())
                                     if dup_peak > self._diag_input_peaks[dup_dev_idx]:
@@ -527,6 +531,13 @@ class AudioManager:
                                 has_data = True
                             else:
                                 self._diag_stale_reads += 1
+
+                        # Inject duplex-captured input directly (guaranteed fresh,
+                        # not dependent on ring buffer timing)
+                        if _dup_buf_local is not None:
+                            di, buf = _dup_buf_local
+                            input_bufs[di] = buf
+                            has_data = True
 
                         if not has_data:
                             self._diag_no_data += 1
@@ -2551,13 +2562,17 @@ class MixerStripView(QtWidgets.QWidget):
         self.input_channel_count = len(labels)
         self.input_labels = labels
         for strip in self.strips:
-            prev = strip['input_combo'].currentData()
-            self._populate_input_combo(strip['input_combo'])
+            combo = strip['input_combo']
+            prev = combo.currentData()
+            # Block signals during repopulation to prevent spam
+            combo.blockSignals(True)
+            self._populate_input_combo(combo)
             # Try to restore previous selection
             if prev is not None:
-                idx = strip['input_combo'].findData(prev)
+                idx = combo.findData(prev)
                 if idx >= 0:
-                    strip['input_combo'].setCurrentIndex(idx)
+                    combo.setCurrentIndex(idx)
+            combo.blockSignals(False)
 
     def get_mapping(self):
         """Return mapping in the same format as TrackMapperWidget.get_mapping().
@@ -2614,6 +2629,40 @@ class MixerStripView(QtWidgets.QWidget):
                         if isinstance(r_src, dict):
                             r_idx = r_src.get('index', 0)
                             strip['stereo_btn'].setChecked(r_idx != idx)
+
+    def auto_assign_devices(self, input_infos, num_output_tracks=4):
+        """Auto-assign each input device to its own track strip."""
+        num_tracks = min(4, max(1, num_output_tracks))
+        # Block signals to avoid spamming mapping_changed per widget change
+        self.blockSignals(True)
+        for s in self.strips:
+            s['input_combo'].blockSignals(True)
+            s['on_btn'].blockSignals(True)
+            s['stereo_btn'].blockSignals(True)
+            s['dial'].blockSignals(True)
+        try:
+            ch_offset = 0
+            for dev_idx, info in enumerate(input_infos):
+                track_idx = dev_idx % num_tracks
+                if track_idx >= len(self.strips):
+                    break
+                strip = self.strips[track_idx]
+                combo_idx = strip['input_combo'].findData(ch_offset)
+                if combo_idx >= 0:
+                    strip['input_combo'].setCurrentIndex(combo_idx)
+                strip['on_btn'].setChecked(True)
+                strip['stereo_btn'].setChecked(True)
+                strip['dial'].setValue(100)
+                ch_offset += info['channels']
+        finally:
+            for s in self.strips:
+                s['input_combo'].blockSignals(False)
+                s['on_btn'].blockSignals(False)
+                s['stereo_btn'].blockSignals(False)
+                s['dial'].blockSignals(False)
+            self.blockSignals(False)
+        # Emit once after all changes
+        self.mapping_changed.emit()
 
     def get_track_color(self, track_idx):
         return self._track_colors[track_idx % len(self._track_colors)]
@@ -3096,10 +3145,18 @@ class MainWindow(QtWidgets.QMainWindow):
             for slot, mixer in self.mixer_views.items():
                 mixer.update_for_inputs(input_infos)
 
-            # Auto-assign devices to tracks on primary output mapper
-            output_channels = self.channels_combo_a.currentData()
-            num_output_tracks = (output_channels // 2) if output_channels else 1
-            self.track_mapper.auto_assign_devices(input_infos, num_output_tracks)
+            # Auto-assign all views when NOT routing (initial setup).
+            # During routing, only update labels — don't overwrite user routing.
+            if not self.audio_manager.is_routing:
+                for slot in list(self.track_mappers.keys()):
+                    ch_combo = {'A': self.channels_combo_a,
+                                'B': self.channels_combo_b,
+                                'C': self.channels_combo_c}.get(slot)
+                    out_ch = ch_combo.currentData() if ch_combo else None
+                    num_tracks = (out_ch // 2) if out_ch else 4
+                    self.track_mappers[slot].auto_assign_devices(input_infos, num_tracks)
+                    if slot in self.mixer_views:
+                        self.mixer_views[slot].auto_assign_devices(input_infos, num_tracks)
 
             # Update status message
             device_summary = ", ".join(f"{info['label']}({info['channels']}ch)" for info in input_infos)
@@ -3292,11 +3349,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 mixer.mapping_changed.connect(lambda oi=out_idx: self.apply_mapping(oi))
                 self.mixer_views[slot] = mixer
                 self.mixer_tabs.addTab(mixer, f"Output {slot}")
-                # Initialize with current input info
+                # Initialize with current input info and auto-assign
                 input_infos = self.get_input_infos()
                 if input_infos:
                     mapper.update_for_inputs(input_infos)
                     mixer.update_for_inputs(input_infos)
+                    # Auto-assign input routing so B/C outputs get
+                    # their own input channels (not all defaulting to A)
+                    out_ch = ch_combo.currentData()
+                    num_tracks = (out_ch // 2) if out_ch else 4
+                    mapper.auto_assign_devices(input_infos, num_tracks)
+                    mixer.auto_assign_devices(input_infos, num_tracks)
             elif not is_enabled and slot in self.track_mappers:
                 # Remove detail mapper tab
                 mapper = self.track_mappers.pop(slot)
@@ -3334,18 +3397,24 @@ class MainWindow(QtWidgets.QMainWindow):
             output_devices = self.get_enabled_output_devices()
 
             if not input_devices or not output_devices:
-                self.statusBar().showMessage("Please select at least one input and one output device")
+                QtWidgets.QMessageBox.warning(
+                    self, "Cannot Start",
+                    "Please select at least one input and one output device.")
                 return
 
             # Duplicate output validation
-            seen_indices = set()
+            seen_indices = {}
             for od in output_devices:
                 if od['index'] in seen_indices:
                     name = self.device_map.get(od['index'], {}).get('name', '?')
-                    self.statusBar().showMessage(
-                        f"Error: '{name}' selected for multiple outputs - each output must be a different device")
+                    prev = seen_indices[od['index']]
+                    QtWidgets.QMessageBox.warning(
+                        self, "Duplicate Output Device",
+                        f"'{name}' is selected for both Output {prev} and Output {od['label']}.\n\n"
+                        f"Each output slot must use a different device.\n"
+                        f"Set one of them to '-- Off --' or choose a different device.")
                     return
-                seen_indices.add(od['index'])
+                seen_indices[od['index']] = od['label']
 
             sample_rate = self.sample_rate_combo.currentData() or 48000
 
@@ -3383,7 +3452,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.statusBar().showMessage(
                     f"Routing [{in_names}] -> [{out_names}] ({sample_rate}Hz 32-bit float)")
             else:
-                self.statusBar().showMessage("Failed to start audio routing - Check device settings")
+                QtWidgets.QMessageBox.warning(
+                    self, "Routing Failed",
+                    "Failed to start audio routing.\nCheck device settings and ensure devices are not in use.")
+                self.statusBar().showMessage("Failed to start audio routing")
     
     def apply_mapping(self, output_idx=0):
         """Apply the current track mapping to the audio manager for a specific output."""
@@ -3396,6 +3468,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         mapping = mapper.get_mapping()
+        dbg(f">>> apply_mapping(output_idx={output_idx}, label={label}, "
+            f"view={self._current_view}, routing={self.audio_manager.is_routing})")
+        dbg(f"    raw mapping: {mapping}")
 
         def describe(entry):
             if isinstance(entry, dict):
