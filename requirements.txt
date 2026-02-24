@@ -2,3 +2,4 @@ numpy
 PyAudio
 PyQt5
 scipy
+soundfile

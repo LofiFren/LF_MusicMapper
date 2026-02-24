@@ -4,12 +4,24 @@ LF Music Mapper - Routes audio inputs to specific output tracks with enhanced vi
 """
 
 import sys
+import os
+import json
+import math
+import queue
+import datetime
 import numpy as np
 import pyaudio
 import time
-from threading import Thread
+from threading import Thread, Lock
 from collections import deque
 from scipy.fft import fft  # For spectrum analysis
+
+try:
+    import soundfile as sf
+    _HAS_SOUNDFILE = True
+except ImportError:
+    sf = None
+    _HAS_SOUNDFILE = False
 from themes import THEMES, generate_qss, build_spectrogram_lut
 
 # macOS-only: programmatic CoreAudio aggregate device creation for split
@@ -69,6 +81,8 @@ class AudioManager:
         self.viz_output_idx = 0  # Which output drives visualization
 
         self._aggregate_device_ids = []  # CoreAudio aggregates (macOS only)
+        self.sample_players = [None, None, None]  # Virtual inputs (one per slot)
+        self.recorder = None  # StemRecorder instance when recording
 
         # Audio diagnostics — always-on, lightweight, logs to file
         self._diag_file = None
@@ -185,6 +199,8 @@ class AudioManager:
         if self.is_routing:
             self.stop_routing()
 
+        self._sample_rate = sample_rate
+
         # Normalize to list-of-dicts format
         if isinstance(output_devices_or_idx, int):
             output_devices = [{'index': output_devices_or_idx,
@@ -199,8 +215,11 @@ class AudioManager:
 
             dbg(f"\n----- AUDIO DEVICE DETAILS -----")
             for i, dev in enumerate(input_devices):
-                info = self.pa.get_device_info_by_index(dev['index'])
                 label = chr(ord('A') + i)
+                if dev['index'] < 0:
+                    dbg(f"Input {label}: Sample Player ({dev['channels']} ch)")
+                    continue
+                info = self.pa.get_device_info_by_index(dev['index'])
                 dbg(f"Input {label}: {info['name']} ({dev['channels']} ch)")
             for i, dev in enumerate(output_devices):
                 info = self.pa.get_device_info_by_index(dev['index'])
@@ -273,6 +292,9 @@ class AudioManager:
                 self._diag_file.write(f"Sample rate: {rate} Hz | Buffer: {self.buffer_size} frames "
                                       f"({self.buffer_size/rate*1000:.1f}ms)\n")
                 for i, dev in enumerate(input_devices):
+                    if dev['index'] < 0:
+                        self._diag_file.write(f"Input {chr(ord('A')+i)}: Sample Player ({dev['channels']}ch)\n")
+                        continue
                     info = self.pa.get_device_info_by_index(dev['index'])
                     self._diag_file.write(f"Input {chr(ord('A')+i)}: {info['name']} ({dev['channels']}ch)\n")
                 for i, dev in enumerate(output_devices):
@@ -311,6 +333,8 @@ class AudioManager:
                 for di, idev in enumerate(input_devices):
                     if di in _claimed_inputs:
                         continue
+                    if idev['index'] < 0:
+                        continue  # sample player — skip duplex detection
                     in_name = self.pa.get_device_info_by_index(idev['index'])['name']
                     if idev['index'] == odev['index'] or in_name == out_name:
                         out_info = self.pa.get_device_info_by_index(odev['index'])
@@ -343,6 +367,8 @@ class AudioManager:
                 # Save device names before any potential PyAudio re-init
                 _saved_in_names = {}
                 for _si, _sd in enumerate(input_devices):
+                    if _sd['index'] < 0:
+                        continue  # sample player
                     _saved_in_names[_si] = self.pa.get_device_info_by_index(
                         _sd['index'])['name']
                 _saved_out_names = {}
@@ -525,6 +551,13 @@ class AudioManager:
                         has_data = False
                         input_bufs = [None] * len(self.input_channel_counts)
                         for i in range(len(self.input_channel_counts)):
+                            # Sample player: pull directly (sample-accurate)
+                            if i < len(self.sample_players) and self.sample_players[i] is not None:
+                                buf = self.sample_players[i].get_next_buffer(frame_count)
+                                input_bufs[i] = buf
+                                self.input_raw_data[i] = buf
+                                has_data = True
+                                continue
                             rb = self._output_ringbufs[out_idx][i]
                             if rb:
                                 input_bufs[i] = rb.popleft()
@@ -623,6 +656,11 @@ class AudioManager:
                                     if sample_count < self.buffer_size:
                                         self.audio_data[sample_count:, ch] = 0
 
+                        # Feed recorder (non-blocking)
+                        if self.recorder and self.recorder.is_recording:
+                            _out_label = output_devices[out_idx]['label'] if out_idx < len(output_devices) else 'A'
+                            self.recorder.feed_output(out_idx, _out_label, output_frames[:, :out_channels])
+
                         result = (output_frames.flatten().tobytes(), pyaudio.paContinue)
 
                         # Track callback duration
@@ -680,12 +718,17 @@ class AudioManager:
 
                 return output_callback
 
-            # Open one input stream per device (skip duplex-paired inputs)
+            # Open one input stream per device (skip duplex-paired and sample player inputs)
             self.input_streams = []
             for dev_idx, dev in enumerate(input_devices):
                 if dev_idx in _duplex_input_idxs:
                     dbg(f"Skipping separate input stream for "
                         f"{chr(ord('A') + dev_idx)} (full-duplex)")
+                    self.input_streams.append(None)  # placeholder
+                    continue
+                if dev['index'] == -1:
+                    dbg(f"Skipping hardware stream for "
+                        f"{chr(ord('A') + dev_idx)} (sample player)")
                     self.input_streams.append(None)  # placeholder
                     continue
                 label = chr(ord('A') + dev_idx)
@@ -738,6 +781,7 @@ class AudioManager:
                 self.output_streams.append(stream)
 
             self.is_routing = True
+
             dbg(f"\nStarted routing with {len(input_devices)} input(s), "
                 f"{len(output_devices)} output(s)")
             return True
@@ -750,6 +794,10 @@ class AudioManager:
     def stop_routing(self):
         """Stop audio routing — flush silence to prevent residual hum."""
         dbg("Stopping audio routing...")
+
+        # Stop recorder before closing streams
+        if self.recorder and self.recorder.is_recording:
+            self.recorder.stop()
 
         self.is_routing = False
 
@@ -829,6 +877,355 @@ class AudioManager:
             self._aggregate_device_ids = []
         self.pa.terminate()
         dbg("Audio resources cleaned up")
+
+
+class PresetManager:
+    """Handles save/load of device chain presets as JSON files."""
+
+    PRESETS_DIR = os.path.join(os.path.expanduser('~'), '.lf_music_mapper', 'presets')
+    LAST_SESSION_FILE = os.path.join(os.path.expanduser('~'), '.lf_music_mapper', '_last_session.json')
+
+    def __init__(self):
+        os.makedirs(self.PRESETS_DIR, exist_ok=True)
+
+    def save_last_session(self, config):
+        """Auto-save current state for next launch."""
+        config['version'] = 1
+        config['name'] = '_last_session'
+        with open(self.LAST_SESSION_FILE, 'w') as f:
+            json.dump(config, f, indent=2)
+
+    def load_last_session(self):
+        """Load last session state, or None if not available."""
+        if not os.path.isfile(self.LAST_SESSION_FILE):
+            return None
+        try:
+            with open(self.LAST_SESSION_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def save_preset(self, name, config):
+        """Save a preset config dict as JSON."""
+        config['name'] = name
+        config['version'] = 1
+        config['created'] = datetime.datetime.now().isoformat()
+        safe_name = "".join(c if c.isalnum() or c in ' -_' else '_' for c in name)
+        filepath = os.path.join(self.PRESETS_DIR, f"{safe_name}.json")
+        with open(filepath, 'w') as f:
+            json.dump(config, f, indent=2)
+        return filepath
+
+    def load_preset(self, filepath):
+        """Load and return a preset dict from a JSON file."""
+        with open(filepath, 'r') as f:
+            return json.load(f)
+
+    def list_presets(self):
+        """Return list of (name, filepath) tuples for all saved presets."""
+        presets = []
+        if not os.path.isdir(self.PRESETS_DIR):
+            return presets
+        for fname in sorted(os.listdir(self.PRESETS_DIR)):
+            if fname.endswith('.json'):
+                fpath = os.path.join(self.PRESETS_DIR, fname)
+                try:
+                    with open(fpath, 'r') as f:
+                        data = json.load(f)
+                    presets.append((data.get('name', fname), fpath))
+                except Exception:
+                    presets.append((fname, fpath))
+        return presets
+
+    def delete_preset(self, filepath):
+        """Delete a preset file."""
+        if os.path.isfile(filepath):
+            os.remove(filepath)
+
+
+class SampleFilePlayer:
+    """Loads an audio file and feeds it as a virtual input device.
+
+    Supports WAV, AIFF, FLAC via soundfile.  Resamples to match the
+    session sample rate.  Provides loop / one-shot playback modes.
+
+    Designed to be called directly from the output callback for
+    sample-accurate timing — no background thread needed.
+    """
+
+    SUPPORTED_EXTENSIONS = ('.wav', '.aiff', '.aif', '.flac')
+    FADE_FRAMES = 64  # crossfade length to avoid clicks
+
+    def __init__(self):
+        self.filepath = None
+        self.filename = ""
+        self.audio_data = None   # np.ndarray (total_frames, channels) float32
+        self.channels = 2
+        self.playhead = 0
+        self.total_frames = 0
+        self.is_playing = False
+        self.is_looping = True
+        self.target_sr = 48000
+        self._fade_out = False   # triggers crossfade to silence
+        self._fade_in = False    # triggers crossfade from silence
+        self._loading = False    # True while loading — callback returns silence
+
+    @staticmethod
+    def prepare_audio(filepath, target_sr):
+        """Load and resample a file (heavy I/O — call from background thread).
+
+        Returns (data, sr, filename) or raises on error.
+        """
+        if not _HAS_SOUNDFILE:
+            raise RuntimeError("soundfile library is not installed")
+        data, sr = sf.read(filepath, dtype='float32')
+        if sr != target_sr:
+            from scipy.signal import resample_poly
+            g = math.gcd(target_sr, sr)
+            data = resample_poly(data, target_sr // g, sr // g, axis=0).astype(np.float32)
+        if data.ndim == 1:
+            data = np.column_stack([data, data])
+        if data.shape[1] > 2:
+            data = data[:, :2]
+        elif data.shape[1] < 2:
+            data = np.column_stack([data, data[:, -1:] * np.ones((len(data), 2 - data.shape[1]), dtype=np.float32)])
+        return data, target_sr, os.path.basename(filepath)
+
+    def install_audio(self, data, target_sr, filename, filepath):
+        """Swap in pre-loaded audio data (fast — safe to call from UI thread).
+
+        The callback sees _loading=True during the swap, so it returns silence.
+        """
+        self._loading = True       # callback returns silence immediately
+        self.is_playing = False
+        self._fade_out = False
+        self._fade_in = False
+        self.playhead = 0
+        self.audio_data = data
+        self.channels = data.shape[1]
+        self.total_frames = len(data)
+        self.target_sr = target_sr
+        self.filepath = filepath
+        self.filename = filename
+        self._loading = False      # callback can read again
+
+    def load(self, filepath, target_sr=48000):
+        """Synchronous load (only for use when NOT routing)."""
+        data, sr, filename = self.prepare_audio(filepath, target_sr)
+        self.install_audio(data, sr, filename, filepath)
+        return True
+
+    def get_next_buffer(self, frame_count):
+        """Return (frame_count, channels) float32 ndarray.
+
+        Called directly from the output callback — must be fast and
+        lock-free (Python GIL protects the simple flag reads).
+        Returns silence (zeros) when not playing, never None.
+        """
+        silence = np.zeros((frame_count, self.channels), dtype=np.float32)
+        if self._loading or self.audio_data is None:
+            return silence
+
+        # Fade-out requested (stop/pause) — return one faded buffer then silence
+        if self._fade_out:
+            self._fade_out = False
+            buf = self._read_raw(frame_count)
+            fade_len = min(self.FADE_FRAMES, frame_count)
+            ramp = np.linspace(1.0, 0.0, fade_len, dtype=np.float32).reshape(-1, 1)
+            buf[:fade_len] *= ramp
+            buf[fade_len:] = 0.0
+            return buf
+
+        if not self.is_playing:
+            return silence
+
+        buf = self._read_raw(frame_count)
+
+        # Fade-in after play() to avoid click
+        if self._fade_in:
+            self._fade_in = False
+            fade_len = min(self.FADE_FRAMES, frame_count)
+            ramp = np.linspace(0.0, 1.0, fade_len, dtype=np.float32).reshape(-1, 1)
+            buf[:fade_len] *= ramp
+
+        return buf
+
+    def _read_raw(self, frame_count):
+        """Read frame_count frames from audio_data, handling loop/one-shot."""
+        audio = self.audio_data    # snapshot reference
+        total = self.total_frames
+        if audio is None or total == 0:
+            return np.zeros((frame_count, self.channels), dtype=np.float32)
+        # Clamp playhead to valid range
+        if self.playhead >= total:
+            self.playhead = 0
+        end = self.playhead + frame_count
+        if end <= total:
+            buf = audio[self.playhead:end].copy()
+            self.playhead = end
+        elif self.is_looping:
+            part1 = audio[self.playhead:total]
+            remaining = frame_count - len(part1)
+            tail = remaining % total
+            parts = [part1]
+            full_loops = remaining // total
+            for _ in range(full_loops):
+                parts.append(audio[:total])
+            if tail > 0:
+                parts.append(audio[:tail])
+            buf = np.vstack(parts)
+            self.playhead = tail
+        else:
+            part = audio[self.playhead:total]
+            if len(part) < frame_count:
+                pad = np.zeros((frame_count - len(part), self.channels), dtype=np.float32)
+                buf = np.vstack([part, pad]) if len(part) > 0 else pad
+            else:
+                buf = part.copy()
+            self.playhead = total
+            self.is_playing = False
+        return buf
+
+    def play(self):
+        self._fade_in = True
+        self.is_playing = True
+
+    def pause(self):
+        if self.is_playing:
+            self._fade_out = True
+            self.is_playing = False
+
+    def stop(self):
+        if self.is_playing:
+            self._fade_out = True
+        self.is_playing = False
+        self.playhead = 0
+
+    def toggle_loop(self):
+        self.is_looping = not self.is_looping
+
+    def get_position_pct(self):
+        if self.total_frames == 0:
+            return 0.0
+        return self.playhead / self.total_frames
+
+    def get_duration_str(self):
+        if self.total_frames == 0 or self.target_sr == 0:
+            return "0:00"
+        secs = self.total_frames / self.target_sr
+        m, s = divmod(int(secs), 60)
+        return f"{m}:{s:02d}"
+
+
+class StemRecorder:
+    """Records per-track stereo pairs and per-output mixed audio to disk.
+
+    Uses a background writer thread with a queue to avoid blocking audio
+    callbacks.  Files are WAV float32 at the session sample rate.
+    """
+
+    def __init__(self):
+        self.is_recording = False
+        self._write_queue = queue.Queue(maxsize=1000)
+        self._writer_thread = None
+        self._session_dir = None
+        self._sf_handles = {}
+
+    def start(self, base_dir, sample_rate, output_devices):
+        """Create session dir, open WAV files, start writer thread.
+
+        output_devices: list of (label, channel_count) tuples, e.g. [('A', 8), ('B', 4)]
+        """
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        self._session_dir = os.path.join(base_dir, f'session_{timestamp}')
+        os.makedirs(self._session_dir, exist_ok=True)
+
+        # Per-track stereo files (tracks from output A only)
+        for t in range(4):
+            path = os.path.join(self._session_dir, f'track_{t+1}_LR.wav')
+            self._sf_handles[f'track_{t}'] = sf.SoundFile(
+                path, mode='w', samplerate=sample_rate,
+                channels=2, format='WAV', subtype='FLOAT')
+
+        # Per-output mix files
+        for label, ch_count in output_devices:
+            path = os.path.join(self._session_dir, f'output_{label}_mix.wav')
+            self._sf_handles[f'output_{label}'] = sf.SoundFile(
+                path, mode='w', samplerate=sample_rate,
+                channels=ch_count, format='WAV', subtype='FLOAT')
+
+        self.is_recording = True
+        self._writer_thread = Thread(target=self._writer_loop, daemon=True)
+        self._writer_thread.start()
+        dbg(f"Recording started → {self._session_dir}")
+
+    def stop(self):
+        """Signal writer to flush and stop, close all files."""
+        self.is_recording = False
+        self._write_queue.put(None)  # sentinel
+        if self._writer_thread:
+            self._writer_thread.join(timeout=5.0)
+            self._writer_thread = None
+        for handle in self._sf_handles.values():
+            try:
+                handle.close()
+            except Exception:
+                pass
+        self._sf_handles.clear()
+        dbg("Recording stopped")
+
+    def feed_output(self, out_idx, out_label, output_frames):
+        """Called from output_callback with the mixed output data.
+
+        output_frames: np.ndarray (frame_count, out_channels) float32
+        Non-blocking; drops data if queue is full.
+        """
+        if not self.is_recording:
+            return
+        try:
+            out_channels = output_frames.shape[1]
+            # Extract per-track stereo pairs (only from output A to avoid dupes)
+            tracks_data = None
+            if out_label == 'A':
+                tracks_data = {}
+                for t in range(min(4, out_channels // 2)):
+                    left = output_frames[:, t * 2]
+                    right_ch = t * 2 + 1
+                    right = output_frames[:, right_ch] if right_ch < out_channels else left
+                    tracks_data[t] = np.column_stack([left, right])
+
+            self._write_queue.put_nowait({
+                'out_label': out_label,
+                'output_mix': output_frames.copy(),
+                'tracks': tracks_data,
+            })
+        except queue.Full:
+            pass  # drop rather than block
+
+    def _writer_loop(self):
+        """Background thread: dequeue audio data and write to disk."""
+        while True:
+            item = self._write_queue.get()
+            if item is None:
+                # Drain remaining
+                while not self._write_queue.empty():
+                    remaining = self._write_queue.get()
+                    if remaining is not None:
+                        self._write_item(remaining)
+                break
+            self._write_item(item)
+
+    def _write_item(self, item):
+        out_label = item['out_label']
+        key = f'output_{out_label}'
+        if key in self._sf_handles:
+            self._sf_handles[key].write(item['output_mix'])
+        tracks = item.get('tracks')
+        if tracks:
+            for t_idx, t_data in tracks.items():
+                key = f'track_{t_idx}'
+                if key in self._sf_handles:
+                    self._sf_handles[key].write(t_data)
 
 
 class MixDialog(QtWidgets.QDialog):
@@ -2676,6 +3073,143 @@ class MixerStripView(QtWidgets.QWidget):
                 strip['on_btn'].setStyleSheet(self._toggle_style(True, color))
 
 
+class SamplePlayerWidget(QtWidgets.QGroupBox):
+    """UI widget for loading and controlling sample file playback."""
+
+    file_loaded = Signal(str)  # emits filepath when a file is loaded
+    slot_changed = Signal()    # emits when input slot assignment changes
+
+    def __init__(self, parent=None):
+        super().__init__("Sample Player", parent)
+        self.player = SampleFilePlayer()
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QtWidgets.QGridLayout(self)
+        layout.setSpacing(6)
+
+        # Row 0: Load button + filename
+        self.load_btn = QtWidgets.QPushButton("Load File")
+        self.load_btn.clicked.connect(self._open_file_dialog)
+        layout.addWidget(self.load_btn, 0, 0)
+
+        self.file_label = QtWidgets.QLabel("No file loaded")
+        self.file_label.setStyleSheet("color: #AAAAAA; font-size: 11px;")
+        layout.addWidget(self.file_label, 0, 1, 1, 3)
+
+        # Row 1: Transport controls + loop toggle + duration
+        self.play_btn = QtWidgets.QPushButton("Play")
+        self.play_btn.setEnabled(False)
+        self.play_btn.clicked.connect(self._on_play)
+        layout.addWidget(self.play_btn, 1, 0)
+
+        self.pause_btn = QtWidgets.QPushButton("Pause")
+        self.pause_btn.setEnabled(False)
+        self.pause_btn.clicked.connect(self._on_pause)
+        layout.addWidget(self.pause_btn, 1, 1)
+
+        self.stop_btn = QtWidgets.QPushButton("Stop")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self._on_stop)
+        layout.addWidget(self.stop_btn, 1, 2)
+
+        self.loop_btn = QtWidgets.QPushButton("Loop")
+        self.loop_btn.setCheckable(True)
+        self.loop_btn.setChecked(True)
+        self.loop_btn.setEnabled(False)
+        self.loop_btn.toggled.connect(self._on_loop_toggle)
+        layout.addWidget(self.loop_btn, 1, 3)
+
+        # Row 2: Input slot selector + duration label
+        layout.addWidget(QtWidgets.QLabel("Route to:"), 2, 0)
+        self.slot_combo = QtWidgets.QComboBox()
+        self.slot_combo.addItem("-- Off --", None)
+        self.slot_combo.addItem("Input A", "A")
+        self.slot_combo.addItem("Input B", "B")
+        self.slot_combo.addItem("Input C", "C")
+        self.slot_combo.setCurrentIndex(1)  # Default to Input A
+        self.slot_combo.setEnabled(False)
+        self.slot_combo.currentIndexChanged.connect(lambda: self.slot_changed.emit())
+        layout.addWidget(self.slot_combo, 2, 1)
+
+        self.duration_label = QtWidgets.QLabel("")
+        self.duration_label.setStyleSheet("color: #AAAAAA; font-size: 11px;")
+        layout.addWidget(self.duration_label, 2, 2, 1, 2)
+
+    def _open_file_dialog(self):
+        filepath, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Load Audio File", "",
+            "Audio Files (*.wav *.aiff *.aif *.flac);;All Files (*)")
+        if filepath:
+            self.load_file(filepath)
+
+    def load_file(self, filepath, target_sr=48000):
+        """Load an audio file — heavy I/O runs in a background thread."""
+        self.player.stop()
+        self.play_btn.setStyleSheet("")
+        self.load_btn.setEnabled(False)
+        self.file_label.setText("Loading...")
+        self._load_result = None
+
+        def bg_load():
+            try:
+                data, sr, filename = SampleFilePlayer.prepare_audio(filepath, target_sr)
+                self._load_result = (data, sr, filename, filepath, None)
+            except Exception as e:
+                self._load_result = (None, None, None, filepath, str(e))
+
+        self._load_thread = Thread(target=bg_load, daemon=True)
+        self._load_thread.start()
+
+        # Poll from main thread until done (keeps UI responsive)
+        self._load_poll_timer = QtCore.QTimer()
+        self._load_poll_timer.timeout.connect(self._poll_load)
+        self._load_poll_timer.start(50)
+
+    def _poll_load(self):
+        """Check if background load finished."""
+        if self._load_result is None:
+            return  # still loading
+        self._load_poll_timer.stop()
+        data, sr, filename, filepath, error = self._load_result
+        self._load_result = None
+        self.load_btn.setEnabled(True)
+        if error:
+            self.file_label.setText("Load failed")
+            QtWidgets.QMessageBox.warning(self, "Load Error", f"Cannot load file:\n{error}")
+            return
+        self.player.install_audio(data, sr, filename, filepath)
+        self.file_label.setText(self.player.filename)
+        self.duration_label.setText(self.player.get_duration_str())
+        for btn in (self.play_btn, self.pause_btn, self.stop_btn, self.loop_btn, self.slot_combo):
+            btn.setEnabled(True)
+        self.file_loaded.emit(filepath)
+
+    def _on_play(self):
+        self.player.play()
+        self.play_btn.setStyleSheet("background-color: #2E7D32; color: white;")
+
+    def _on_pause(self):
+        self.player.pause()
+        self.play_btn.setStyleSheet("")
+
+    def _on_stop(self):
+        self.player.stop()
+        self.play_btn.setStyleSheet("")
+
+    def _on_loop_toggle(self, checked):
+        self.player.is_looping = checked
+        self.loop_btn.setText("Loop" if checked else "One-Shot")
+
+    def get_assigned_slot(self):
+        """Return 'A', 'B', 'C', or None."""
+        return self.slot_combo.currentData()
+
+    def is_active(self):
+        """Return True if a file is loaded and assigned to a slot."""
+        return self.player.audio_data is not None and self.get_assigned_slot() is not None
+
+
 class MainWindow(QtWidgets.QMainWindow):
     """Main application window with enhanced visualizations"""
     def __init__(self):
@@ -2688,20 +3222,34 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Update title to reflect enhanced version
         self.setWindowTitle("LF Music Mapper - By: @LofiFren")
-        self.setMinimumSize(1400, 820)  # Wider default to keep routing presets readable
+        self.setMinimumSize(1500, 1100)  # Taller to fit sample player + preset row
         
         # Create central widget and layout
         central_widget = QtWidgets.QWidget()
         self.setCentralWidget(central_widget)
         
         main_layout = QtWidgets.QVBoxLayout(central_widget)
-        main_layout.setSpacing(12)
+        main_layout.setSpacing(4)
+        main_layout.setContentsMargins(8, 4, 8, 4)
         
         # Theme state
         self._current_theme = 'Dark'
 
-        # Menu bar — View > Theme
+        # Preset manager + session restore flag
+        self.preset_manager = PresetManager()
+        self._session_restored = False
+
+        # Menu bar
         menubar = self.menuBar()
+
+        # File menu — Presets
+        file_menu = menubar.addMenu("File")
+        save_preset_action = file_menu.addAction("Save Preset...")
+        save_preset_action.triggered.connect(self._save_preset_dialog)
+        load_preset_action = file_menu.addAction("Load Preset...")
+        load_preset_action.triggered.connect(self._load_preset_dialog)
+
+        # View > Theme
         view_menu = menubar.addMenu("View")
         theme_menu = view_menu.addMenu("Theme")
         self._theme_actions = {}
@@ -2715,29 +3263,27 @@ class MainWindow(QtWidgets.QMainWindow):
             action.triggered.connect(lambda checked, n=name: self.apply_theme(n))
             self._theme_actions[name] = action
 
-        # Title and version
+        # Title and version — compact single line
         title_layout = QtWidgets.QHBoxLayout()
+        title_layout.setContentsMargins(0, 0, 0, 0)
         self._title_label = QtWidgets.QLabel("LF Music Mapper")
-        self._title_label.setStyleSheet("font-size: 20px; font-weight: bold; color: #EEEEEE;")
+        self._title_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #EEEEEE;")
         title_layout.addWidget(self._title_label)
 
         self._version_label = QtWidgets.QLabel("By: @LofiFren")
-        self._version_label.setStyleSheet("font-size: 14px; color: #AAAAAA;")
+        self._version_label.setStyleSheet("font-size: 11px; color: #AAAAAA;")
         self._version_label.setAlignment(QtCore.Qt.AlignBottom)
         title_layout.addWidget(self._version_label)
+
+        self._intro_label = QtWidgets.QLabel(
+            " — Route inputs to multichannel outputs, define mapping on the left, monitor on the right."
+        )
+        self._intro_label.setStyleSheet("color: #888888; font-size: 11px;")
+        title_layout.addWidget(self._intro_label)
 
         title_layout.addStretch()
 
         main_layout.addLayout(title_layout)
-
-        # Inline helper text to replace the old popup dialog
-        self._intro_label = QtWidgets.QLabel(
-            "Route any available input into dedicated multichannel outputs. "
-            "Choose your devices, define the mapping on the left, and monitor your signal on the right."
-        )
-        self._intro_label.setStyleSheet("color: #BBBBBB; font-size: 12px;")
-        self._intro_label.setWordWrap(True)
-        main_layout.addWidget(self._intro_label)
         
         # Split the primary UI into routing controls (left) and visualization (right)
         content_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
@@ -2837,9 +3383,49 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sample_rate_combo.setCurrentIndex(1)  # Default to 48000 Hz
         device_layout.addWidget(self.sample_rate_combo, 3, 3)
 
+        self.record_btn = QtWidgets.QPushButton("Record")
+        self.record_btn.setCheckable(True)
+        self.record_btn.setEnabled(False)
+        self.record_btn.toggled.connect(self._toggle_recording)
+        device_layout.addWidget(self.record_btn, 3, 4)
+
+        self._record_blink_timer = QtCore.QTimer()
+        self._record_blink_timer.timeout.connect(self._blink_record)
+        self._record_blink_on = True
+
+        # Preset row: Save, Save As, Load, current preset label
+        self._current_preset_path = None
+        self._current_preset_name = None
+
+        save_btn = QtWidgets.QPushButton("Save")
+        save_btn.setToolTip("Quick-save to current preset (or prompts for name)")
+        save_btn.clicked.connect(self._quick_save_preset)
+        device_layout.addWidget(save_btn, 4, 0)
+
+        save_as_btn = QtWidgets.QPushButton("Save As...")
+        save_as_btn.setToolTip("Save current config as a new preset")
+        save_as_btn.clicked.connect(self._save_preset_dialog)
+        device_layout.addWidget(save_as_btn, 4, 1)
+
+        load_btn = QtWidgets.QPushButton("Load Preset")
+        load_btn.clicked.connect(self._load_preset_dialog)
+        device_layout.addWidget(load_btn, 4, 2)
+
+        self._preset_label = QtWidgets.QLabel("No preset loaded")
+        self._preset_label.setStyleSheet("color: #AAAAAA; font-size: 11px;")
+        device_layout.addWidget(self._preset_label, 4, 3, 1, 2)
+
         device_group.setLayout(device_layout)
         left_layout.addWidget(device_group)
-        
+
+        # Sample player widget
+        self.sample_player_widget = SamplePlayerWidget()
+        self.sample_player_widget.slot_changed.connect(self._on_sample_slot_changed)
+        left_layout.addWidget(self.sample_player_widget)
+
+        # Enable drag-and-drop for audio files
+        self.setAcceptDrops(True)
+
         # Per-output track mapping via tabs
         mapper_group = QtWidgets.QGroupBox("Track Routing")
         mapper_layout = QtWidgets.QVBoxLayout()
@@ -2908,13 +3494,20 @@ class MainWindow(QtWidgets.QMainWindow):
         right_layout.addWidget(viz_group)
         right_layout.addStretch()
         
+        # Wrap left panel in a scroll area so it scrolls when content is tall
+        left_scroll = QtWidgets.QScrollArea()
+        left_scroll.setWidget(left_panel)
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setMinimumWidth(740)
+        left_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+
         # Add panels to splitter and place splitter in the main layout
-        content_splitter.addWidget(left_panel)
+        content_splitter.addWidget(left_scroll)
         content_splitter.addWidget(right_panel)
         content_splitter.setStretchFactor(0, 3)
         content_splitter.setStretchFactor(1, 2)
         content_splitter.setSizes([840, 560])
-        main_layout.addWidget(content_splitter)
+        main_layout.addWidget(content_splitter, stretch=1)
         
         # Status bar
         self.statusBar().showMessage("Ready - Enhanced visualization enabled")
@@ -3088,24 +3681,35 @@ class MainWindow(QtWidgets.QMainWindow):
     def get_input_infos(self):
         """Get info for all enabled input devices.
 
-        A device counts as enabled when a real device (not '-- Off --') is selected.
-        Returns list of {'label': str, 'channels': int, 'index': int}
+        A device counts as enabled when a real device (not '-- Off --') is selected,
+        or when the sample player is assigned to that slot.
+        Returns list of {'label': str, 'channels': int, 'index': int, 'is_sample': bool}
         """
         infos = []
+        sample_slot = self.sample_player_widget.get_assigned_slot()
         combos = [
             ('A', self.input_combo_a),
             ('B', self.input_combo_b),
             ('C', self.input_combo_c),
         ]
         for label, combo in combos:
-            dev_idx = combo.currentData()
-            if dev_idx is not None and dev_idx in self.device_map:
-                channels = int(self.device_map[dev_idx]['inputs'])
-                infos.append({'label': label, 'channels': channels, 'index': dev_idx})
+            if sample_slot == label and self.sample_player_widget.player.audio_data is not None:
+                infos.append({
+                    'label': label,
+                    'channels': self.sample_player_widget.player.channels,
+                    'index': -1,
+                    'is_sample': True,
+                })
+            else:
+                dev_idx = combo.currentData()
+                if dev_idx is not None and dev_idx in self.device_map:
+                    channels = int(self.device_map[dev_idx]['inputs'])
+                    infos.append({'label': label, 'channels': channels, 'index': dev_idx, 'is_sample': False})
         return infos
 
     def get_enabled_input_devices(self):
-        """Get list of {'index': int, 'channels': int} for start_routing."""
+        """Get list of {'index': int, 'channels': int} for start_routing.
+        Sample player slots use index -1."""
         return [{'index': info['index'], 'channels': info['channels']}
                 for info in self.get_input_infos()]
 
@@ -3289,6 +3893,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._updating_inputs = False
         self.input_device_changed()
 
+        # Restore last session on first launch only
+        if not self._session_restored:
+            self._session_restored = True
+            last = self.preset_manager.load_last_session()
+            if last:
+                self._apply_preset_config(last)
+                self.statusBar().showMessage("Last session restored")
+                return
         self.statusBar().showMessage("Devices refreshed - select your input and output devices")
     
     def _get_output_combos(self, slot):
@@ -3377,9 +3989,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def toggle_routing(self):
         """Start or stop audio routing"""
         if self.audio_manager.is_routing:
+            # Stop recording first if active
+            if self.record_btn.isChecked():
+                self.record_btn.setChecked(False)
+
             self.audio_manager.stop_routing()
             self.route_btn.setText("Start Routing")
             self.route_btn.setStyleSheet("")
+            self.record_btn.setEnabled(False)
             self.statusBar().showMessage("Audio routing stopped")
 
             # Reset guard so device changes work again
@@ -3418,6 +4035,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
             sample_rate = self.sample_rate_combo.currentData() or 48000
 
+            # Set up sample player as virtual input if assigned
+            self.audio_manager.sample_players = [None, None, None]
+            sample_slot = self.sample_player_widget.get_assigned_slot()
+            if sample_slot and self.sample_player_widget.player.audio_data is not None:
+                slot_idx = {'A': 0, 'B': 1, 'C': 2}[sample_slot]
+                player = self.sample_player_widget.player
+                # Re-resample if sample rate changed
+                if player.target_sr != sample_rate:
+                    player.load(player.filepath, sample_rate)
+                self.audio_manager.sample_players[slot_idx] = player
+
             # Apply all active output mappings
             for oi, label in enumerate(['A', 'B', 'C']):
                 if label in self.track_mappers:
@@ -3431,6 +4059,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"background-color: {danger}; color: white; "
                     f"font-weight: bold; min-height: 35px; border-radius: 5px;"
                 )
+                self.record_btn.setEnabled(True)
 
                 # Disable all device selectors while routing
                 for combo in [self.input_combo_a, self.input_combo_b, self.input_combo_c,
@@ -3447,7 +4076,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
                 # Build status message
                 input_infos = self.get_input_infos()
-                in_names = " + ".join(f"{info['label']}:{self.device_map[info['index']]['name']}" for info in input_infos)
+                in_parts = []
+                for info in input_infos:
+                    if info.get('is_sample'):
+                        in_parts.append(f"{info['label']}:Sample")
+                    elif info['index'] in self.device_map:
+                        in_parts.append(f"{info['label']}:{self.device_map[info['index']]['name']}")
+                in_names = " + ".join(in_parts)
                 out_names = " + ".join(f"{od['label']}:{self.device_map[od['index']]['name']}" for od in output_devices if od['index'] in self.device_map)
                 self.statusBar().showMessage(
                     f"Routing [{in_names}] -> [{out_names}] ({sample_rate}Hz 32-bit float)")
@@ -3502,8 +4137,276 @@ class MainWindow(QtWidgets.QMainWindow):
         # Update the track mapper status
         mapper.status_label.setText(f"Mapping applied: {mapping_str}")
     
+    # ── Sample player live switching ─────────────────────────────────────
+
+    def _on_sample_slot_changed(self):
+        """Update AudioManager.sample_players live when slot assignment changes."""
+        if not self.audio_manager.is_routing:
+            return
+        # Clear all sample player slots
+        self.audio_manager.sample_players = [None, None, None]
+        slot = self.sample_player_widget.get_assigned_slot()
+        if slot and self.sample_player_widget.player.audio_data is not None:
+            slot_idx = {'A': 0, 'B': 1, 'C': 2}[slot]
+            self.audio_manager.sample_players[slot_idx] = self.sample_player_widget.player
+
+    # ── Drag-and-drop support ────────────────────────────────────────────
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if url.toLocalFile().lower().endswith(SampleFilePlayer.SUPPORTED_EXTENSIONS):
+                    event.acceptProposedAction()
+                    return
+
+    def dropEvent(self, event):
+        for url in event.mimeData().urls():
+            filepath = url.toLocalFile()
+            if filepath.lower().endswith(SampleFilePlayer.SUPPORTED_EXTENSIONS):
+                sr = self.sample_rate_combo.currentData() or 48000
+                self.sample_player_widget.load_file(filepath, sr)
+                break
+
+    # ── Preset save / load ──────────────────────────────────────────────
+
+    def _collect_preset_config(self):
+        """Gather current device selections, sample rate, view mode, and mappings."""
+        config = {
+            'sample_rate': self.sample_rate_combo.currentData() or 48000,
+            'view_mode': self._current_view,
+            'inputs': [],
+            'outputs': [],
+            'mappings': {},
+        }
+        # Input devices
+        for slot, combo in [('A', self.input_combo_a), ('B', self.input_combo_b), ('C', self.input_combo_c)]:
+            dev_idx = combo.currentData()
+            if dev_idx is not None and dev_idx in self.device_map:
+                config['inputs'].append({
+                    'slot': slot,
+                    'device_name': self.device_map[dev_idx]['name'],
+                    'channels': int(self.device_map[dev_idx]['inputs']),
+                })
+            else:
+                config['inputs'].append({'slot': slot, 'device_name': None, 'channels': 0})
+        # Output devices
+        for slot, dev_combo, ch_combo in [
+            ('A', self.output_combo_a, self.channels_combo_a),
+            ('B', self.output_combo_b, self.channels_combo_b),
+            ('C', self.output_combo_c, self.channels_combo_c),
+        ]:
+            dev_idx = dev_combo.currentData()
+            channels = ch_combo.currentData()
+            if dev_idx is not None and dev_idx in self.device_map:
+                config['outputs'].append({
+                    'slot': slot,
+                    'device_name': self.device_map[dev_idx]['name'],
+                    'channels': channels or int(self.device_map[dev_idx]['outputs']),
+                })
+            else:
+                config['outputs'].append({'slot': slot, 'device_name': None, 'channels': 0})
+        # Mappings from both views
+        for slot in ['A', 'B', 'C']:
+            if self._current_view == 'mixer':
+                mapper = self.mixer_views.get(slot)
+            else:
+                mapper = self.track_mappers.get(slot)
+            if mapper:
+                config['mappings'][slot] = mapper.get_mapping()
+        return config
+
+    def _apply_preset_config(self, config):
+        """Restore device selections, sample rate, view mode, and mappings from a preset."""
+        missing = []
+
+        # Sample rate
+        sr = config.get('sample_rate', 48000)
+        for i in range(self.sample_rate_combo.count()):
+            if self.sample_rate_combo.itemData(i) == sr:
+                self.sample_rate_combo.setCurrentIndex(i)
+                break
+
+        # Build name→index lookups from cached devices
+        input_name_map = {}
+        for dev in self._cached_input_devices:
+            input_name_map[dev['name']] = dev['index']
+        output_name_map = {}
+        for dev in self._cached_output_devices:
+            output_name_map[dev['name']] = dev['index']
+
+        # Restore inputs
+        input_combos = {'A': self.input_combo_a, 'B': self.input_combo_b, 'C': self.input_combo_c}
+        for inp in config.get('inputs', []):
+            slot = inp.get('slot')
+            name = inp.get('device_name')
+            combo = input_combos.get(slot)
+            if not combo:
+                continue
+            if name is None:
+                combo.setCurrentIndex(0)  # "-- Off --"
+                continue
+            dev_idx = input_name_map.get(name)
+            if dev_idx is not None:
+                idx = combo.findData(dev_idx)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+                else:
+                    missing.append(f"Input {slot}: {name}")
+            else:
+                missing.append(f"Input {slot}: {name}")
+
+        # Restore outputs
+        output_combos = {'A': self.output_combo_a, 'B': self.output_combo_b, 'C': self.output_combo_c}
+        channel_combos = {'A': self.channels_combo_a, 'B': self.channels_combo_b, 'C': self.channels_combo_c}
+        for out in config.get('outputs', []):
+            slot = out.get('slot')
+            name = out.get('device_name')
+            combo = output_combos.get(slot)
+            if not combo:
+                continue
+            if name is None:
+                combo.setCurrentIndex(0)
+                continue
+            dev_idx = output_name_map.get(name)
+            if dev_idx is not None:
+                idx = combo.findData(dev_idx)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+                    # Restore channel count
+                    ch = out.get('channels')
+                    ch_combo = channel_combos.get(slot)
+                    if ch and ch_combo:
+                        ch_idx = ch_combo.findData(ch)
+                        if ch_idx >= 0:
+                            ch_combo.setCurrentIndex(ch_idx)
+                else:
+                    missing.append(f"Output {slot}: {name}")
+            else:
+                missing.append(f"Output {slot}: {name}")
+
+        # Switch view mode if needed
+        view_mode = config.get('view_mode', self._current_view)
+        if view_mode != self._current_view:
+            self._switch_view(view_mode)
+
+        # Restore mappings
+        mappings = config.get('mappings', {})
+        for slot, mapping in mappings.items():
+            if self._current_view == 'mixer':
+                mapper = self.mixer_views.get(slot)
+            else:
+                mapper = self.track_mappers.get(slot)
+            if mapper and mapping:
+                mapper.set_mapping(mapping)
+
+        if missing:
+            QtWidgets.QMessageBox.warning(
+                self, "Missing Devices",
+                "The following devices from the preset were not found:\n\n"
+                + "\n".join(f"  - {m}" for m in missing)
+                + "\n\nOther settings have been applied.")
+
+    def _quick_save_preset(self):
+        """One-click save to current preset, or prompt for name if none set."""
+        if self._current_preset_path and self._current_preset_name:
+            config = self._collect_preset_config()
+            self.preset_manager.save_preset(self._current_preset_name, config)
+            self._preset_label.setText(f"Preset: {self._current_preset_name}")
+            self.statusBar().showMessage(f"Preset saved: {self._current_preset_name}")
+        else:
+            self._save_preset_dialog()
+
+    def _save_preset_dialog(self):
+        """Prompt for a name and save as a new preset."""
+        default = self._current_preset_name or ""
+        name, ok = QtWidgets.QInputDialog.getText(
+            self, "Save Preset As", "Preset name:", text=default)
+        if not ok or not name.strip():
+            return
+        config = self._collect_preset_config()
+        filepath = self.preset_manager.save_preset(name.strip(), config)
+        self._current_preset_name = name.strip()
+        self._current_preset_path = filepath
+        self._preset_label.setText(f"Preset: {name.strip()}")
+        self.statusBar().showMessage(f"Preset saved: {name.strip()}")
+
+    def _load_preset_dialog(self):
+        """Show open dialog and load a preset."""
+        filepath, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Load Preset", self.preset_manager.PRESETS_DIR,
+            "Presets (*.json)")
+        if not filepath:
+            return
+        try:
+            config = self.preset_manager.load_preset(filepath)
+            self._apply_preset_config(config)
+            name = config.get('name', 'Unknown')
+            self._current_preset_name = name
+            self._current_preset_path = filepath
+            self._preset_label.setText(f"Preset: {name}")
+            self.statusBar().showMessage(f"Preset loaded: {name}")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self, "Load Error", f"Failed to load preset:\n{e}")
+
+    # ── Stem recording ──────────────────────────────────────────────────
+
+    def _toggle_recording(self, checked):
+        if checked:
+            if not self.audio_manager.is_routing:
+                self.record_btn.setChecked(False)
+                return
+            if not _HAS_SOUNDFILE:
+                QtWidgets.QMessageBox.warning(
+                    self, "Missing Library",
+                    "The 'soundfile' package is required for recording.\n"
+                    "Install it with: pip install soundfile")
+                self.record_btn.setChecked(False)
+                return
+            sample_rate = self.sample_rate_combo.currentData() or 48000
+            output_devices = self.get_enabled_output_devices()
+            base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'recordings')
+            recorder = StemRecorder()
+            recorder.start(
+                base_dir, sample_rate,
+                [(d['label'], d['channels']) for d in output_devices])
+            self.audio_manager.recorder = recorder
+            self.record_btn.setText("Stop Rec")
+            self._record_blink_timer.start(500)
+            self.statusBar().showMessage(f"Recording to {recorder._session_dir}")
+        else:
+            session_dir = ""
+            if self.audio_manager.recorder:
+                session_dir = self.audio_manager.recorder._session_dir or ""
+                self.audio_manager.recorder.stop()
+                self.audio_manager.recorder = None
+            self.record_btn.setText("Record")
+            self._record_blink_timer.stop()
+            self.record_btn.setStyleSheet("")
+            self._record_blink_on = True
+            if session_dir:
+                self.statusBar().showMessage(f"Recording saved to {session_dir}")
+
+    def _blink_record(self):
+        if self.record_btn.isChecked():
+            self._record_blink_on = not self._record_blink_on
+            color = '#CC0000' if self._record_blink_on else '#880000'
+            self.record_btn.setStyleSheet(
+                f"background-color: {color}; color: white; font-weight: bold;")
+
     def closeEvent(self, event):
-        """Handle window close event — stop visualization before audio cleanup."""
+        """Handle window close event — save session, stop viz, clean up audio."""
+        # Auto-save current config so next launch matches
+        try:
+            config = self._collect_preset_config()
+            self.preset_manager.save_last_session(config)
+        except Exception:
+            pass
+        # Stop recording if active
+        self._record_blink_timer.stop()
+        if self.audio_manager.recorder and self.audio_manager.recorder.is_recording:
+            self.audio_manager.recorder.stop()
+            self.audio_manager.recorder = None
         # Stop all timers first so they don't touch audio during teardown
         self.update_timer.stop()
         self.spectrogram_3d.update_timer.stop()
