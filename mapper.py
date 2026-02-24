@@ -3080,7 +3080,7 @@ class SamplePlayerWidget(QtWidgets.QGroupBox):
     slot_changed = Signal()    # emits when input slot assignment changes
 
     def __init__(self, parent=None):
-        super().__init__("Sample Player", parent)
+        super().__init__("Lazy Sample Loader", parent)
         self.player = SampleFilePlayer()
         self._build_ui()
 
