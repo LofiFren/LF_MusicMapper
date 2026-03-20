@@ -82,7 +82,17 @@ class AudioManager:
 
         self._aggregate_device_ids = []  # CoreAudio aggregates (macOS only)
         self.sample_players = [None, None, None]  # Virtual inputs (one per slot)
+        self._input_slot_map = []  # sequential index → slot index (0=A,1=B,2=C)
         self.recorder = None  # StemRecorder instance when recording
+
+        # Effects engine (separate module, optional)
+        self.effects_engine = None
+        try:
+            from effects import EffectsEngine
+            self.effects_engine = EffectsEngine(
+                sample_rate=48000, buffer_size=self.buffer_size)
+        except ImportError:
+            pass
 
         # Audio diagnostics — always-on, lightweight, logs to file
         self._diag_file = None
@@ -200,6 +210,9 @@ class AudioManager:
             self.stop_routing()
 
         self._sample_rate = sample_rate
+        if self.effects_engine:
+            self.effects_engine.set_sample_rate(sample_rate)
+            self.effects_engine.reset_all()
 
         # Normalize to list-of-dicts format
         if isinstance(output_devices_or_idx, int):
@@ -551,13 +564,6 @@ class AudioManager:
                         has_data = False
                         input_bufs = [None] * len(self.input_channel_counts)
                         for i in range(len(self.input_channel_counts)):
-                            # Sample player: pull directly (sample-accurate)
-                            if i < len(self.sample_players) and self.sample_players[i] is not None:
-                                buf = self.sample_players[i].get_next_buffer(frame_count)
-                                input_bufs[i] = buf
-                                self.input_raw_data[i] = buf
-                                has_data = True
-                                continue
                             rb = self._output_ringbufs[out_idx][i]
                             if rb:
                                 input_bufs[i] = rb.popleft()
@@ -571,6 +577,24 @@ class AudioManager:
                             di, buf = _dup_buf_local
                             input_bufs[di] = buf
                             has_data = True
+
+                        # Mix sample player audio additively on top of
+                        # live device data (after ring buffers + duplex
+                        # are resolved so nothing gets overwritten).
+                        _slot_map = self._input_slot_map
+                        for i in range(len(self.input_channel_counts)):
+                            _slot = _slot_map[i] if i < len(_slot_map) else i
+                            if _slot < len(self.sample_players) and self.sample_players[_slot] is not None:
+                                _sbuf = self.sample_players[_slot].get_next_buffer(frame_count)
+                                if input_bufs[i] is not None:
+                                    _sf = min(frame_count, len(_sbuf))
+                                    _sc = min(_sbuf.shape[1] if len(_sbuf.shape) > 1 else 1,
+                                              input_bufs[i].shape[1] if len(input_bufs[i].shape) > 1 else 1)
+                                    input_bufs[i][:_sf, :_sc] += _sbuf[:_sf, :_sc]
+                                else:
+                                    input_bufs[i] = _sbuf
+                                self.input_raw_data[i] = input_bufs[i]
+                                has_data = True
 
                         if not has_data:
                             self._diag_no_data += 1
@@ -625,6 +649,14 @@ class AudioManager:
                                 if len(valid_entries) > 1:
                                     mixed /= len(valid_entries)
                                 output_frames[:, out_ch] = mixed
+
+                        # Apply effects (between mapping and soft-clip)
+                        if self.effects_engine and self.effects_engine.enabled:
+                            try:
+                                output_frames = self.effects_engine.process(
+                                    out_idx, output_frames, out_channels)
+                            except Exception:
+                                pass
 
                         # Soft-clip output to prevent popping from hot signals
                         output_frames = np.tanh(output_frames)
@@ -3480,6 +3512,21 @@ class MainWindow(QtWidgets.QMainWindow):
         mapper_layout.addWidget(self.mixer_tabs)
         mapper_group.setLayout(mapper_layout)
         left_layout.addWidget(mapper_group)
+
+        # Effects rack (integrated from effects.py)
+        self.effects_rack = None
+        if self.audio_manager.effects_engine is not None:
+            try:
+                from effects import EffectsRackWidget
+                self.effects_rack = EffectsRackWidget(
+                    self.audio_manager.effects_engine)
+                left_layout.addWidget(self.effects_rack)
+                # Apply initial track colors
+                tc = THEMES[self._current_theme]['palette']['track_colors']
+                self.effects_rack.update_track_colors(tc)
+            except Exception as e:
+                dbg(f"Effects rack init failed: {e}")
+
         left_layout.addStretch()
         
         # Visualization area
@@ -3612,7 +3659,11 @@ class MainWindow(QtWidgets.QMainWindow):
             mixer._track_colors = palette['track_colors']
             mixer._refresh_track_colors()
 
-        # 7. Check the right menu action
+        # 7. Update effects rack track colors
+        if self.effects_rack:
+            self.effects_rack.update_track_colors(palette['track_colors'])
+
+        # 8. Check the right menu action
         if theme_name in self._theme_actions:
             self._theme_actions[theme_name].setChecked(True)
 
@@ -3681,8 +3732,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def get_input_infos(self):
         """Get info for all enabled input devices.
 
-        A device counts as enabled when a real device (not '-- Off --') is selected,
-        or when the sample player is assigned to that slot.
+        Live devices always take priority.  The sample player is mixed
+        additively in the output callback — it does NOT replace a live
+        device.  Only when a slot has no live device does the sample
+        player become the sole input for that slot.
+
         Returns list of {'label': str, 'channels': int, 'index': int, 'is_sample': bool}
         """
         infos = []
@@ -3693,18 +3747,21 @@ class MainWindow(QtWidgets.QMainWindow):
             ('C', self.input_combo_c),
         ]
         for label, combo in combos:
-            if sample_slot == label and self.sample_player_widget.player.audio_data is not None:
+            dev_idx = combo.currentData()
+            if dev_idx is not None and dev_idx in self.device_map:
+                # Live device selected — always include it
+                channels = int(self.device_map[dev_idx]['inputs'])
+                infos.append({'label': label, 'channels': channels,
+                              'index': dev_idx, 'is_sample': False})
+            elif (sample_slot == label
+                  and self.sample_player_widget.player.audio_data is not None):
+                # No live device, but sample player assigned — sample is sole input
                 infos.append({
                     'label': label,
                     'channels': self.sample_player_widget.player.channels,
                     'index': -1,
                     'is_sample': True,
                 })
-            else:
-                dev_idx = combo.currentData()
-                if dev_idx is not None and dev_idx in self.device_map:
-                    channels = int(self.device_map[dev_idx]['inputs'])
-                    infos.append({'label': label, 'channels': channels, 'index': dev_idx, 'is_sample': False})
         return infos
 
     def get_enabled_input_devices(self):
@@ -4035,7 +4092,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
             sample_rate = self.sample_rate_combo.currentData() or 48000
 
-            # Set up sample player as virtual input if assigned
+            # Build slot map: sequential input index → slot index (A=0,B=1,C=2)
+            # so the callback can look up the right sample player
+            input_infos = self.get_input_infos()
+            self.audio_manager._input_slot_map = [
+                {'A': 0, 'B': 1, 'C': 2}[info['label']] for info in input_infos]
+
+            # Set up sample player overlay (additive, not replacing live devices)
             self.audio_manager.sample_players = [None, None, None]
             sample_slot = self.sample_player_widget.get_assigned_slot()
             if sample_slot and self.sample_player_widget.player.audio_data is not None:
@@ -4137,18 +4200,94 @@ class MainWindow(QtWidgets.QMainWindow):
         # Update the track mapper status
         mapper.status_label.setText(f"Mapping applied: {mapping_str}")
     
-    # ── Sample player live switching ─────────────────────────────────────
+    # ── Hot restart & sample player live switching ──────────────────────
+
+    def _hot_restart_routing(self):
+        """Stop and restart routing with current device/sample config.
+
+        Preserves the UI state (button text, combo enables) — only the
+        audio pipeline is torn down and rebuilt so that ring buffers,
+        input_channel_counts, total_input_channels, input streams, and
+        sample_players all reflect the current input/output selection.
+        """
+        sample_rate = self.sample_rate_combo.currentData() or 48000
+        input_devices = self.get_enabled_input_devices()
+        output_devices = self.get_enabled_output_devices()
+
+        if not input_devices or not output_devices:
+            return
+
+        # Stop audio (clears streams, ring buffers, aggregates)
+        self.audio_manager.stop_routing()
+        self._updating_inputs = False
+
+        # Rebuild slot map and sample player overlay
+        input_infos = self.get_input_infos()
+        self.audio_manager._input_slot_map = [
+            {'A': 0, 'B': 1, 'C': 2}[info['label']] for info in input_infos]
+        self.audio_manager.sample_players = [None, None, None]
+        sample_slot = self.sample_player_widget.get_assigned_slot()
+        if sample_slot and self.sample_player_widget.player.audio_data is not None:
+            slot_idx = {'A': 0, 'B': 1, 'C': 2}[sample_slot]
+            player = self.sample_player_widget.player
+            if player.target_sr != sample_rate:
+                player.load(player.filepath, sample_rate)
+            self.audio_manager.sample_players[slot_idx] = player
+        for label in ['A', 'B', 'C']:
+            if label in self.mixer_views:
+                self.mixer_views[label].update_for_inputs(input_infos)
+            if label in self.track_mappers:
+                self.track_mappers[label].update_for_inputs(input_infos)
+
+        # Apply mappings (reads from current mixer/patchbay state)
+        for oi in range(len(output_devices)):
+            self.apply_mapping(oi)
+
+        # Restart — this rebuilds input_channel_counts, ring buffers,
+        # input streams, etc. from scratch
+        if self.audio_manager.start_routing(input_devices, output_devices,
+                                            sample_rate=sample_rate):
+            # Update status bar
+            in_parts = []
+            for info in input_infos:
+                if info.get('is_sample'):
+                    in_parts.append(f"{info['label']}:Sample")
+                elif info['index'] in self.device_map:
+                    in_parts.append(f"{info['label']}:{self.device_map[info['index']]['name']}")
+            in_names = " + ".join(in_parts)
+            out_names = " + ".join(
+                f"{od['label']}:{self.device_map[od['index']]['name']}"
+                for od in output_devices if od['index'] in self.device_map)
+            self.statusBar().showMessage(
+                f"Routing [{in_names}] -> [{out_names}] ({sample_rate}Hz)")
 
     def _on_sample_slot_changed(self):
-        """Update AudioManager.sample_players live when slot assignment changes."""
+        """Update sample player overlay when slot assignment changes.
+
+        Since samples mix additively on top of live device data, we
+        usually just update the sample_players array — the callback
+        picks it up immediately.  A hot restart is only needed when
+        the sample is assigned to a slot that has NO live device
+        (requiring a new input to be added to the pipeline).
+        """
         if not self.audio_manager.is_routing:
             return
-        # Clear all sample player slots
-        self.audio_manager.sample_players = [None, None, None]
+
+        # Update sample_players array (atomic swap, GIL-safe)
+        new_players = [None, None, None]
         slot = self.sample_player_widget.get_assigned_slot()
         if slot and self.sample_player_widget.player.audio_data is not None:
             slot_idx = {'A': 0, 'B': 1, 'C': 2}[slot]
-            self.audio_manager.sample_players[slot_idx] = self.sample_player_widget.player
+            new_players[slot_idx] = self.sample_player_widget.player
+        self.audio_manager.sample_players = new_players
+
+        # Check if the sample slot has a live device in the current pipeline
+        slot_map = self.audio_manager._input_slot_map
+        if slot:
+            target = {'A': 0, 'B': 1, 'C': 2}[slot]
+            if target not in slot_map:
+                # Sample is on a slot with no live device — need to add it
+                self._hot_restart_routing()
 
     # ── Drag-and-drop support ────────────────────────────────────────────
 
