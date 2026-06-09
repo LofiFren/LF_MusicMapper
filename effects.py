@@ -723,11 +723,21 @@ class Gater(EffectBase):
         n = len(frames)
         period = beat_to_samples(self._beat_frac, self._bpm, self.sample_rate)
         shape = self._params['shape']  # 0 = hard square, 1 = smooth sine
+        swing = self._params['swing']  # 0 = straight, 0.9 = heavy shuffle
 
-        # Gate envelope
+        # Gate envelope — work in double-period units for swing
         t = (self._phase + np.arange(n, dtype=np.float64)) / period
-        self._phase = (self._phase + n) % period
-        phase_frac = (t % 1.0).astype(np.float32)
+        self._phase = (self._phase + n) % (period * 2)
+        pair_frac = t % 2.0  # position within a pair of beats [0, 2)
+
+        # Swing: first beat spans [0, 1+swing), second spans [1+swing, 2)
+        # Both are mapped back to [0, 1) for the gate envelope
+        boundary = 1.0 + swing
+        phase_frac = np.where(
+            pair_frac < boundary,
+            pair_frac / boundary,
+            (pair_frac - boundary) / (2.0 - boundary),
+        ).astype(np.float32)
 
         if shape < 0.01:
             gate = (phase_frac < 0.5).astype(np.float32)

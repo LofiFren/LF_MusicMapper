@@ -3453,6 +3453,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Sample player widget
         self.sample_player_widget = SamplePlayerWidget()
         self.sample_player_widget.slot_changed.connect(self._on_sample_slot_changed)
+        self.sample_player_widget.file_loaded.connect(self._on_sample_file_loaded)
         left_layout.addWidget(self.sample_player_widget)
 
         # Enable drag-and-drop for audio files
@@ -4288,6 +4289,23 @@ class MainWindow(QtWidgets.QMainWindow):
             if target not in slot_map:
                 # Sample is on a slot with no live device — need to add it
                 self._hot_restart_routing()
+
+    def _on_sample_file_loaded(self, filepath):
+        """Update sample_players when a new file finishes loading mid-routing.
+
+        Unlike _on_sample_slot_changed, this never triggers a hot restart —
+        the slot assignment hasn't changed, only the audio data within the
+        player.  A simple atomic swap of the sample_players array is enough
+        for the callback to pick up the new audio immediately.
+        """
+        if not self.audio_manager.is_routing:
+            return
+        new_players = [None, None, None]
+        slot = self.sample_player_widget.get_assigned_slot()
+        if slot and self.sample_player_widget.player.audio_data is not None:
+            slot_idx = {'A': 0, 'B': 1, 'C': 2}[slot]
+            new_players[slot_idx] = self.sample_player_widget.player
+        self.audio_manager.sample_players = new_players
 
     # ── Drag-and-drop support ────────────────────────────────────────────
 
