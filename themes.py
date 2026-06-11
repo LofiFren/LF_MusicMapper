@@ -359,55 +359,115 @@ THEMES = {
 # ---------------------------------------------------------------------------
 
 def generate_qss(palette):
-    """Generate the full application QSS stylesheet from a palette dict."""
+    """Generate the full application QSS stylesheet from a palette dict.
+
+    Design language: flat surfaces, soft rounded corners, quiet borders,
+    accent color reserved for focus/selection — DAW-style minimalism.
+    """
     p = palette
     return f"""
         QMainWindow, QWidget {{
             background-color: {p['bg_primary']};
             color: {p['text_primary']};
+            font-size: 13px;
         }}
+
+        /* ── Cards / sections ─────────────────────────────────────── */
         QGroupBox {{
             border: 1px solid {p['border']};
-            border-radius: 8px;
-            margin-top: 1.5ex;
-            font-weight: bold;
-            padding: 10px;
+            border-radius: 10px;
+            margin-top: 22px;
+            padding: 16px 12px 12px 12px;
             background-color: {p['bg_secondary']};
+            font-weight: bold;
         }}
         QGroupBox::title {{
             subcontrol-origin: margin;
-            subcontrol-position: top center;
-            padding: 0 8px;
-            background-color: {p['bg_primary']};
+            subcontrol-position: top left;
+            left: 10px;
+            padding: 2px 6px;
+            color: {p['text_dim']};
+            font-size: 12px;
+            font-weight: bold;
+            background-color: transparent;
         }}
+
+        /* ── Inputs ───────────────────────────────────────────────── */
         QComboBox {{
             background-color: {p['bg_input']};
             border: 1px solid {p['border']};
-            border-radius: 5px;
-            padding: 6px;
+            border-radius: 6px;
+            padding: 4px 10px;
             color: {p['text_primary']};
-            min-height: 25px;
+            min-height: 24px;
         }}
         QComboBox:hover {{
             border-color: {p['accent']};
         }}
+        QComboBox:focus {{
+            border-color: {p['accent']};
+        }}
+        QComboBox:disabled {{
+            color: {p['text_dim']};
+            border-color: {p['border']};
+            background-color: {p['bg_secondary']};
+        }}
         QComboBox::drop-down {{
             border: none;
-            width: 20px;
+            width: 22px;
+        }}
+        QComboBox::down-arrow {{
+            width: 0; height: 0;
+            border-left: 4px solid transparent;
+            border-right: 4px solid transparent;
+            border-top: 5px solid {p['text_dim']};
+            margin-right: 6px;
         }}
         QComboBox QAbstractItemView {{
             background-color: {p['bg_input']};
             color: {p['text_primary']};
             border: 1px solid {p['border']};
+            border-radius: 6px;
+            padding: 4px;
+            selection-background-color: {p['accent']};
+            outline: none;
+        }}
+        QLineEdit {{
+            background-color: {p['bg_input']};
+            border: 1px solid {p['border']};
+            border-radius: 6px;
+            padding: 3px 8px;
+            color: {p['text_primary']};
             selection-background-color: {p['accent']};
         }}
+        QLineEdit:focus {{
+            border-color: {p['accent']};
+        }}
+        QLineEdit:read-only {{
+            background-color: transparent;
+            border-color: transparent;
+        }}
+        QLineEdit#mixDisplay {{
+            background-color: {p['bg_input']};
+            border: 1px solid {p['border']};
+            color: {p['text_secondary']};
+        }}
+        QSpinBox, QDoubleSpinBox {{
+            background-color: {p['bg_input']};
+            border: 1px solid {p['border']};
+            border-radius: 6px;
+            padding: 2px 6px;
+            color: {p['text_primary']};
+        }}
+
+        /* ── Buttons ──────────────────────────────────────────────── */
         QPushButton {{
             background-color: {p['bg_input']};
             border: 1px solid {p['border']};
-            border-radius: 5px;
-            padding: 6px;
+            border-radius: 6px;
+            padding: 5px 12px;
             color: {p['text_primary']};
-            min-height: 25px;
+            min-height: 24px;
         }}
         QPushButton:hover {{
             background-color: {p['hover']};
@@ -415,68 +475,146 @@ def generate_qss(palette):
         }}
         QPushButton:pressed {{
             background-color: {p['accent']};
+            color: white;
         }}
+        QPushButton:checked {{
+            background-color: {p['accent_button']};
+            border-color: {p['accent_button']};
+            color: white;
+        }}
+        QPushButton:disabled {{
+            color: {p['text_dim']};
+            background-color: {p['bg_secondary']};
+        }}
+
         QLabel {{
             padding: 2px;
+            background: transparent;
         }}
         QStatusBar {{
             background-color: {p['bg_tertiary']};
             color: {p['text_secondary']};
+            border-top: 1px solid {p['border']};
         }}
         QCheckBox {{
-            spacing: 5px;
+            spacing: 6px;
+            background: transparent;
         }}
         QCheckBox::indicator {{
-            width: 18px;
-            height: 18px;
-            border-radius: 3px;
+            width: 16px;
+            height: 16px;
+            border-radius: 4px;
+            border: 1px solid {p['border']};
+            background-color: {p['bg_input']};
         }}
+        QCheckBox::indicator:checked {{
+            background-color: {p['accent']};
+            border-color: {p['accent']};
+        }}
+
+        /* ── Tabs: flat with accent underline ─────────────────────── */
         QTabWidget::pane {{
             border: 1px solid {p['border']};
-            border-radius: 5px;
+            border-radius: 8px;
             background: {p['bg_secondary']};
+            top: -1px;
         }}
         QTabBar::tab {{
-            background: {p['bg_primary']};
-            border: 1px solid {p['border']};
-            border-bottom-color: {p['bg_secondary']};
-            border-top-left-radius: 4px;
-            border-top-right-radius: 4px;
-            padding: 6px 10px;
-            margin-right: 2px;
+            background: transparent;
+            border: none;
+            border-bottom: 2px solid transparent;
+            padding: 7px 14px;
+            margin-right: 4px;
+            color: {p['text_secondary']};
         }}
-        QTabBar::tab:selected, QTabBar::tab:hover {{
-            background: {p['bg_input']};
+        QTabBar::tab:hover {{
+            color: {p['text_primary']};
         }}
         QTabBar::tab:selected {{
-            border-bottom-color: {p['bg_secondary']};
+            color: {p['text_bright']};
+            border-bottom: 2px solid {p['accent']};
         }}
+
+        /* ── Sliders ──────────────────────────────────────────────── */
         QSlider::groove:horizontal {{
-            border: 1px solid {p['border']};
-            height: 8px;
-            background: {p['bg_primary']};
+            border: none;
+            height: 4px;
+            background: {p['bg_input']};
             margin: 2px 0;
-            border-radius: 4px;
+            border-radius: 2px;
+        }}
+        QSlider::sub-page:horizontal {{
+            background: {p['accent']};
+            border-radius: 2px;
         }}
         QSlider::handle:horizontal {{
-            background: {p['accent']};
-            border: 1px solid {p['accent']};
-            width: 18px;
-            height: 18px;
-            margin: -6px 0;
-            border-radius: 9px;
+            background: {p['text_bright']};
+            border: none;
+            width: 14px;
+            height: 14px;
+            margin: -5px 0;
+            border-radius: 7px;
         }}
         QSlider::handle:horizontal:hover {{
             background: {p['accent_hover']};
         }}
 
+        /* ── Scrollbars: slim, quiet ──────────────────────────────── */
+        QScrollBar:vertical {{
+            background: transparent;
+            width: 10px;
+            margin: 2px;
+        }}
+        QScrollBar::handle:vertical {{
+            background: {p['border']};
+            border-radius: 3px;
+            min-height: 30px;
+        }}
+        QScrollBar::handle:vertical:hover {{
+            background: {p['accent']};
+        }}
+        QScrollBar:horizontal {{
+            background: transparent;
+            height: 10px;
+            margin: 2px;
+        }}
+        QScrollBar::handle:horizontal {{
+            background: {p['border']};
+            border-radius: 3px;
+            min-width: 30px;
+        }}
+        QScrollBar::handle:horizontal:hover {{
+            background: {p['accent']};
+        }}
+        QScrollBar::add-line, QScrollBar::sub-line {{
+            width: 0; height: 0;
+        }}
+        QScrollBar::add-page, QScrollBar::sub-page {{
+            background: transparent;
+        }}
+
+        /* ── Mixer strip cards ────────────────────────────────────── */
+        QFrame#mixerStrip {{
+            background-color: {p['bg_tertiary']};
+            border: 1px solid {p['border']};
+            border-radius: 10px;
+        }}
+
+        /* ── Effects rack slot cards ──────────────────────────────── */
+        QWidget#fxSlot {{
+            background-color: {p['bg_tertiary']};
+            border: 1px solid {p['border']};
+            border-radius: 8px;
+        }}
+
         /* Apply button style */
         #applyButton {{
             background-color: {p['accent_button']};
+            border-color: {p['accent_button']};
             color: white;
             font-weight: bold;
             min-height: 35px;
-            border-radius: 5px;
+            border-radius: 6px;
         }}
         #applyButton:hover {{
             background-color: {p['accent_button_hover']};
@@ -491,9 +629,25 @@ def generate_qss(palette):
             background-color: {p['preset_hover']};
         }}
 
-        /* QDial (mixer strip volume knob) */
+        /* Quiet mode toggles (e.g. STEREO/MONO) — the label IS the state,
+           so checked gets no accent fill */
+        QPushButton[quiet="true"]:checked {{
+            background-color: {p['bg_input']};
+            border-color: {p['border']};
+            color: {p['text_primary']};
+        }}
+
+        /* Knobs paint themselves (MiniKnob) — keep the backdrop clean */
         QDial {{
-            background-color: {p['bg_secondary']};
+            background-color: transparent;
+        }}
+
+        QToolTip {{
+            background-color: {p['bg_tertiary']};
+            color: {p['text_primary']};
+            border: 1px solid {p['border']};
+            border-radius: 4px;
+            padding: 4px 6px;
         }}
 
         /* Menu bar */
@@ -502,13 +656,24 @@ def generate_qss(palette):
             color: {p['text_primary']};
             border-bottom: 1px solid {p['border']};
         }}
+        QMenuBar::item {{
+            padding: 4px 10px;
+            background: transparent;
+        }}
         QMenuBar::item:selected {{
             background-color: {p['hover']};
+            border-radius: 4px;
         }}
         QMenu {{
             background-color: {p['bg_input']};
             color: {p['text_primary']};
             border: 1px solid {p['border']};
+            border-radius: 6px;
+            padding: 4px;
+        }}
+        QMenu::item {{
+            padding: 5px 18px;
+            border-radius: 4px;
         }}
         QMenu::item:selected {{
             background-color: {p['accent']};

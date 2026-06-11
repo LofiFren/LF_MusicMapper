@@ -5,6 +5,7 @@ LF Music Mapper - Routes audio inputs to specific output tracks with enhanced vi
 
 import sys
 import os
+import re
 import json
 import math
 import queue
@@ -23,6 +24,7 @@ except ImportError:
     sf = None
     _HAS_SOUNDFILE = False
 from themes import THEMES, generate_qss, build_spectrogram_lut
+from widgets import MiniKnob
 
 # macOS-only: programmatic CoreAudio aggregate device creation for split
 # USB devices (e.g. S-4 enumerated as separate input/output entries).
@@ -44,6 +46,30 @@ def dbg(*args, **kwargs):
     if DEBUG:
         print(*args, **kwargs)
 
+
+# Generic words dropped from PortAudio device names when deriving short
+# display names ("Volt 476 USB Audio Device" -> "Volt 476").
+_DEVICE_NOISE_WORDS = {'usb', 'audio', 'device', 'interface', 'codec', 'external'}
+
+
+def short_device_name(name, max_len=16):
+    """Compact display name for a PortAudio device name.
+
+    Strips parentheticals and generic noise words, then truncates with an
+    ellipsis so the name fits in channel labels and mixer combos. Users can
+    override the result entirely with a custom alias (see MainWindow).
+    """
+    if not name:
+        return str(name)
+    base = re.sub(r'\([^)]*\)', ' ', str(name))
+    words = [w for w in base.split() if w.lower() not in _DEVICE_NOISE_WORDS]
+    short = ' '.join(words) if words else ' '.join(base.split())
+    if not short:
+        short = str(name).strip()
+    if len(short) > max_len:
+        short = short[:max_len - 1].rstrip() + '…'
+    return short
+
 # First try PySide2, then try PyQt5 as fallback
 try:
     from PySide2 import QtCore, QtWidgets, QtGui
@@ -64,12 +90,21 @@ except ImportError:
 
 class AudioManager:
     """Manages audio devices and routing with track mapping capability"""
+
+    # Buffers over which outputs ramp to silence when stopping (~85ms at
+    # 48kHz/1024). Closing streams mid-signal is what causes stop noise.
+    STOP_FADE_BUFFERS = 4
+
     def __init__(self):
         self.pa = pyaudio.PyAudio()
         self.input_streams = []  # List of input streams (up to 3 devices)
         self.output_streams = []  # List of output streams (up to 3 devices)
         self.is_routing = False
         self.buffer_size = 1024
+        # Stop fade-out: callbacks ramp output to silence before streams close
+        self._stopping = False
+        self._stop_gains = []      # per-output gain, 1.0 → 0.0 during stop
+        self._stop_gain_step = 1.0 / self.STOP_FADE_BUFFERS
         self.audio_data = np.zeros((self.buffer_size, 8), dtype=np.float32)
         self.channel_levels = [0.0] * 8
         self.debug_counter = 0
@@ -291,6 +326,8 @@ class AudioManager:
                 for _ in range(num_outputs)
             ]
             self._prev_outputs = [None] * num_outputs  # per-output fade-out
+            self._stopping = False
+            self._stop_gains = [1.0] * num_outputs  # stop fade-out state
             self._diag_stale_reads = 0
             self._diag_input_peaks = [0.0] * num_inputs  # per-input peak tracking
 
@@ -598,6 +635,12 @@ class AudioManager:
 
                         if not has_data:
                             self._diag_no_data += 1
+                            # While stopping, never resurrect the previous
+                            # (full-volume) buffer — emit straight silence
+                            if self._stopping:
+                                self._stop_gains[out_idx] = 0.0
+                                silence = np.zeros(frame_count * _stream_channels, dtype=np.float32)
+                                return (silence.tobytes(), pyaudio.paContinue)
                             # Fade out previous output to avoid hard cut to silence
                             prev = self._prev_outputs[out_idx]
                             if prev is not None:
@@ -667,6 +710,20 @@ class AudioManager:
                             padded = np.zeros((frame_count, _stream_channels), dtype=np.float32)
                             padded[:, :out_channels] = output_frames
                             output_frames = padded
+
+                        # Stop fade-out: ramp the final signal to silence over
+                        # a few buffers so closing the stream never cuts audio
+                        # mid-waveform (the source of stop clicks/noise)
+                        if self._stopping:
+                            g = self._stop_gains[out_idx]
+                            if g <= 0.0:
+                                output_frames[:] = 0.0
+                            else:
+                                next_g = max(0.0, g - self._stop_gain_step)
+                                ramp = np.linspace(g, next_g, frame_count,
+                                                   dtype=np.float32).reshape(-1, 1)
+                                output_frames = output_frames * ramp
+                                self._stop_gains[out_idx] = next_g
 
                         # Save for fade-out on future underrun
                         self._prev_outputs[out_idx] = output_frames.copy()
@@ -824,7 +881,7 @@ class AudioManager:
             return False
     
     def stop_routing(self):
-        """Stop audio routing — flush silence to prevent residual hum."""
+        """Stop audio routing — fade outputs to silence, then close streams."""
         dbg("Stopping audio routing...")
 
         # Stop recorder before closing streams
@@ -833,14 +890,18 @@ class AudioManager:
 
         self.is_routing = False
 
-        # Zero out all input buffers so the callback outputs silence immediately
+        # Ask all output callbacks to ramp to silence, then wait for the
+        # fade to finish. Stopping streams while they still carry signal is
+        # what produced the audible noise burst on stop.
+        self._stopping = True
+        if self.output_streams:
+            sr = float(getattr(self, '_sample_rate', 48000) or 48000)
+            fade_s = (self.STOP_FADE_BUFFERS + 2) * self.buffer_size / sr
+            time.sleep(fade_s)
+
+        # Zero out all input buffers so anything still polling sees silence
         for i in range(len(self.input_raw_data)):
             self.input_raw_data[i] = None
-        self.channel_levels = [0.0] * 8
-        self.audio_data = np.zeros((self.buffer_size, 8), dtype=np.float32)
-
-        # Brief pause to let the callback emit at least one silent buffer
-        time.sleep(0.05)
 
         # Close all input streams (None entries are duplex placeholders)
         for i, stream in enumerate(self.input_streams):
@@ -877,6 +938,22 @@ class AudioManager:
                 except Exception as e:
                     dbg(f"Error destroying aggregate {agg_id}: {e}")
             self._aggregate_device_ids = []
+
+        # Flush leftover audio state so nothing replays on the next start:
+        # ring buffers still hold up to ~85ms of audio, _prev_outputs holds
+        # the last full-volume buffer, and effects keep delay/reverb tails.
+        self._output_ringbufs = []
+        self._prev_outputs = []
+        if self.effects_engine:
+            try:
+                self.effects_engine.reset_all()
+            except Exception as e:
+                dbg(f"Effects reset on stop failed: {e}")
+
+        # Clear visualization data after the callbacks are gone
+        self.channel_levels = [0.0] * 8
+        self.audio_data = np.zeros((self.buffer_size, 8), dtype=np.float32)
+        self._stopping = False
 
         # Close diagnostics log
         if self._diag_file:
@@ -1172,8 +1249,10 @@ class StemRecorder:
         self._session_dir = os.path.join(base_dir, f'session_{timestamp}')
         os.makedirs(self._session_dir, exist_ok=True)
 
-        # Per-track stereo files (tracks from output A only)
-        for t in range(4):
+        # Per-track stereo files (tracks come from output A only) — create
+        # only as many as output A actually has, no empty stub WAVs
+        a_channels = next((ch for label, ch in output_devices if label == 'A'), 8)
+        for t in range(min(4, max(1, a_channels // 2))):
             path = os.path.join(self._session_dir, f'track_{t+1}_LR.wav')
             self._sf_handles[f'track_{t}'] = sf.SoundFile(
                 path, mode='w', samplerate=sample_rate,
@@ -1615,24 +1694,24 @@ class TrackMapperWidget(QtWidgets.QWidget):
             # Add per-device buttons
             ch_offset = 0
             for info in self.current_input_infos:
-                dev_label = info['label']
+                dev_name = info.get('name') or info['label']
                 dev_channels = info['channels']
                 if dev_channels >= 2:
                     # Stereo pair buttons — one per pair of channels.
-                    # 2-channel device: "B Stereo"
-                    # 4-channel device: "B 1-2" (e.g. Dry) and "B 3-4" (e.g. Wet/FX)
+                    # 2-channel device: "Digitakt"
+                    # 4-channel device: "Heat 1/2" (e.g. Dry) and "Heat 3/4" (e.g. Wet/FX)
                     num_pairs = dev_channels // 2
                     for pair_idx in range(num_pairs):
                         left_idx = ch_offset + pair_idx * 2
                         right_idx = left_idx + 1
                         if num_pairs == 1:
-                            label_text = f"{dev_label} Stereo"
-                            tip = f"Set track to stereo ({dev_label}1->L, {dev_label}2->R)"
+                            label_text = dev_name
+                            tip = f"Set track to stereo ({dev_name} 1->L, {dev_name} 2->R)"
                         else:
                             ch_lo = pair_idx * 2 + 1
                             ch_hi = ch_lo + 1
-                            label_text = f"{dev_label} {ch_lo}-{ch_hi}"
-                            tip = f"Set track to {dev_label}{ch_lo}->L, {dev_label}{ch_hi}->R"
+                            label_text = f"{dev_name} {ch_lo}/{ch_hi}"
+                            tip = f"Set track to {dev_name} {ch_lo}->L, {dev_name} {ch_hi}->R"
                         btn = QtWidgets.QPushButton(label_text)
                         btn.setToolTip(tip)
                         btn.setProperty("preset", "true")
@@ -1641,7 +1720,7 @@ class TrackMapperWidget(QtWidgets.QWidget):
                 # Mono button for each channel of this device
                 for ch in range(dev_channels):
                     global_idx = ch_offset + ch
-                    ch_label = f"{dev_label}{ch+1}"
+                    ch_label = f"{dev_name} {ch+1}"
                     btn = QtWidgets.QPushButton(ch_label)
                     btn.setToolTip(f"Set track to mono with {ch_label}")
                     btn.setProperty("preset", "true")
@@ -1668,13 +1747,13 @@ class TrackMapperWidget(QtWidgets.QWidget):
     def update_for_inputs(self, input_infos):
         """Update channel options based on all active input devices.
 
-        input_infos: list of {'label': str, 'channels': int}
+        input_infos: list of {'label': str, 'channels': int, 'name': str (optional)}
         """
         labels = []
         for info in input_infos:
-            dev_label = info['label']
+            dev_name = info.get('name') or info['label']
             for ch in range(info['channels']):
-                labels.append(f"{dev_label}{ch+1}")
+                labels.append(f"{dev_name} {ch+1}")
         self.input_channel_count = len(labels)
         self.input_labels = labels
         self.current_input_infos = input_infos
@@ -1770,7 +1849,7 @@ class TrackMapperWidget(QtWidgets.QWidget):
         ch_offset = 0
         for dev_idx, info in enumerate(input_infos):
             track_idx = dev_idx % num_tracks
-            parts.append(f"{info['label']}->Track {track_idx + 1}")
+            parts.append(f"{info.get('name') or info['label']}->Track {track_idx + 1}")
             ch_offset += info['channels']
         self.status_label.setText(f"Auto-assigned: {', '.join(parts)}")
 
@@ -2116,6 +2195,7 @@ class EnhancedMultiLevelMeter(QtWidgets.QWidget):
         self.clip_duration = 60  # Frames to show clip indicator (1 second at 60fps)
         self.num_channels = channels
         self.tick_levels = [0, -3, -6, -12, -24, -40, -60]
+        self.track_names = None  # optional custom names, synced from the mixer view
 
         # Theme-driven meter colors (defaults match Dark theme)
         dark = THEMES['Dark']
@@ -2138,6 +2218,11 @@ class EnhancedMultiLevelMeter(QtWidgets.QWidget):
         """Update the number of channels shown"""
         self.num_channels = min(num_channels, 8)  # Limit to 8 channels max
         self.setMinimumSize(20 * self.num_channels, 200)
+        self.update()
+
+    def set_track_names(self, names):
+        """Show custom track names above the meters instead of 'Track N'."""
+        self.track_names = list(names) if names else None
         self.update()
 
     def set_meter_zones(self, zones, peak_zones, palette):
@@ -2316,28 +2401,6 @@ class EnhancedMultiLevelMeter(QtWidgets.QWidget):
             text_rect = QtCore.QRectF(x, height - 18, meter_width, 16)
             painter.drawText(text_rect, QtCore.Qt.AlignCenter, label)
             
-            # Also draw track number at top
-            if ch % 2 == 0:  # Only for left channels
-                top_rect = QtCore.QRectF(x, 2, meter_width * 2, 16)
-                painter.setFont(QtGui.QFont("Arial", 9, QtGui.QFont.Bold))
-                
-                # Color the track label based on channel activity
-                track_activity = max(self.levels[ch], self.levels[ch+1]) if ch+1 < self.num_channels else self.levels[ch]
-                
-                if track_activity > 0.7:
-                    # Active track - use color based on level
-                    if track_activity > 0.95:
-                        painter.setPen(QtGui.QColor(255, 100, 100))  # Red for high levels
-                    elif track_activity > 0.85:
-                        painter.setPen(QtGui.QColor(255, 180, 0))  # Orange for medium-high
-                    else:
-                        painter.setPen(QtGui.QColor(220, 220, 0))  # Yellow for medium
-                else:
-                    # Normal or inactive track
-                    painter.setPen(QtGui.QColor(150, 150, 150))
-                
-                painter.drawText(top_rect, QtCore.Qt.AlignCenter, f"Track {track_num}")
-                
             # Draw clip indicator text at top of meter if clipping
             if self.clip_indicators[ch] > 0:
                 painter.setFont(QtGui.QFont("Arial", 7, QtGui.QFont.Bold))
@@ -2350,6 +2413,31 @@ class EnhancedMultiLevelMeter(QtWidgets.QWidget):
                 
                 clip_rect = QtCore.QRectF(x, 25, meter_width, 16)
                 painter.drawText(clip_rect, QtCore.Qt.AlignCenter, "CLIP")
+
+        # Track name row — drawn after all meters so a label spanning two
+        # meter cells isn't overdrawn by the next meter's background
+        painter.setFont(QtGui.QFont("Arial", 9, QtGui.QFont.Bold))
+        for ch in range(0, self.num_channels, 2):
+            x = ch * meter_width
+            track_num = ch // 2 + 1
+            track_activity = (max(self.levels[ch], self.levels[ch + 1])
+                              if ch + 1 < self.num_channels else self.levels[ch])
+            if track_activity > 0.95:
+                painter.setPen(QtGui.QColor(255, 100, 100))
+            elif track_activity > 0.85:
+                painter.setPen(QtGui.QColor(255, 180, 0))
+            elif track_activity > 0.7:
+                painter.setPen(QtGui.QColor(220, 220, 0))
+            else:
+                painter.setPen(QtGui.QColor(150, 150, 150))
+            if self.track_names and track_num - 1 < len(self.track_names):
+                name = self.track_names[track_num - 1]
+                if len(name) > 10:
+                    name = name[:9] + '…'
+            else:
+                name = f"Track {track_num}"
+            painter.drawText(QtCore.QRectF(x, 2, meter_width * 2, 16),
+                             QtCore.Qt.AlignCenter, name)
 
 
 class PatchbayView(QtWidgets.QWidget):
@@ -2378,8 +2466,9 @@ class PatchbayView(QtWidgets.QWidget):
 
         self._track_colors = THEMES['Dark']['palette']['track_colors']
         self.input_infos = [{'label': 'A', 'channels': 2}]
-        self.input_labels = ['A1', 'A2']
+        self.input_labels = ['A 1', 'A 2']
         self.input_channel_count = 2
+        self.track_names = [f"Track {i + 1}" for i in range(4)]
 
         # Connections: (input_idx, output_ch) -> gain float 0.0-1.0
         self._connections = {}
@@ -2425,8 +2514,12 @@ class PatchbayView(QtWidgets.QWidget):
         n_inputs = max(1, self.input_channel_count)
         n_outputs = self.NUM_OUTPUTS
 
-        # Header sizes — scale down for tight layouts
-        HW = max(self.HEADER_WIDTH_MIN, min(56, int(widget_w * 0.1)))
+        # Header sizes — scale down for tight layouts.
+        # Row headers show device-based names ("Volt 476 1"), so the width
+        # cap grows with the longest label instead of a fixed 56px.
+        max_label_len = max((len(l) for l in self.input_labels), default=2)
+        hw_cap = max(56, min(120, 7 * max_label_len + 10))
+        HW = max(self.HEADER_WIDTH_MIN, min(hw_cap, int(widget_w * 0.22)))
         HH = max(self.HEADER_HEIGHT_MIN, min(44, int(widget_h * 0.08)))
 
         # Available area for the grid
@@ -2454,14 +2547,22 @@ class PatchbayView(QtWidgets.QWidget):
         self.input_infos = input_infos
         labels = []
         for info in input_infos:
+            name = info.get('name') or info['label']
             for ch in range(info['channels']):
-                labels.append(f"{info['label']}{ch + 1}")
+                labels.append(f"{name} {ch + 1}")
         self.input_channel_count = len(labels)
         self.input_labels = labels
         # Prune connections that reference removed inputs
         to_remove = [k for k in self._connections if k[0] >= self.input_channel_count]
         for k in to_remove:
             del self._connections[k]
+        self._matrix_widget.update()
+
+    def set_track_names(self, names):
+        """Update column-header track names (synced from the mixer view)."""
+        for i, name in enumerate(names or []):
+            if i < len(self.track_names) and name:
+                self.track_names[i] = name
         self._matrix_widget.update()
 
     # -- Mapping API (same format as MixerStripView / TrackMapperWidget) ---
@@ -2764,7 +2865,11 @@ class _PatchbayMatrix(QtWidgets.QWidget):
             x = HW + track * 2 * CW
             painter.setPen(tc)
             track_rect = QtCore.QRectF(x, 1, CW * 2, HH * 0.55)
-            painter.drawText(track_rect, QtCore.Qt.AlignCenter, f"Track {track + 1}")
+            names = getattr(self.pb, 'track_names', None)
+            track_name = names[track] if names and track < len(names) else f"Track {track + 1}"
+            if len(track_name) > 10:
+                track_name = track_name[:9] + '…'
+            painter.drawText(track_rect, QtCore.Qt.AlignCenter, track_name)
             painter.setFont(QtGui.QFont("Arial", font_small))
             painter.setPen(text_dim)
             l_rect = QtCore.QRectF(x, HH * 0.5, CW, HH * 0.5)
@@ -2849,16 +2954,63 @@ class _PatchbayMatrix(QtWidgets.QWidget):
         return QtCore.QSize(w, h)
 
 
+class ClickableLabel(QtWidgets.QLabel):
+    """Label that emits a signal on double-click (used to rename devices)."""
+
+    doubleClicked = Signal()
+
+    def mouseDoubleClickEvent(self, event):
+        self.doubleClicked.emit()
+        super().mouseDoubleClickEvent(event)
+
+
+class TrackNameEdit(QtWidgets.QLineEdit):
+    """Inline-renameable track title: double-click to edit, Enter/click-away commits.
+
+    Looks like a plain label until double-clicked (Ableton-style track rename).
+    """
+
+    renamed = Signal()
+
+    def __init__(self, text, parent=None):
+        super().__init__(text, parent)
+        self._default = text
+        self.setAlignment(QtCore.Qt.AlignCenter)
+        self.setFrame(False)
+        self.setReadOnly(True)
+        self.setFocusPolicy(QtCore.Qt.ClickFocus)
+        self.setToolTip("Double-click to rename")
+        self.editingFinished.connect(self._commit)
+
+    def mouseDoubleClickEvent(self, event):
+        self.setReadOnly(False)
+        self.setFocus()
+        self.selectAll()
+
+    def _commit(self):
+        if self.isReadOnly():
+            return
+        if not self.text().strip():
+            self.setText(self._default)
+        else:
+            self.setText(self.text().strip())
+        self.setReadOnly(True)
+        self.deselect()
+        self.clearFocus()
+        self.renamed.emit()
+
+
 class MixerStripView(QtWidgets.QWidget):
     """Alternative mixer-strip UI: per-track on/off, mono/stereo, volume knob, input selector."""
 
     mapping_changed = Signal()
+    track_names_changed = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._track_colors = THEMES['Dark']['palette']['track_colors']
         self.input_infos = [{'label': 'A', 'channels': 2}]
-        self.input_labels = ['A1', 'A2']
+        self.input_labels = ['A 1', 'A 2']
         self.input_channel_count = 2
 
         self.strips = []  # list of strip state dicts
@@ -2885,16 +3037,16 @@ class MixerStripView(QtWidgets.QWidget):
         """Create a single track strip with on/off, mono/stereo, dial, and input selector."""
         color = self._track_colors[track_idx % len(self._track_colors)]
         frame = QtWidgets.QFrame()
-        frame.setFrameStyle(QtWidgets.QFrame.StyledPanel)
+        frame.setObjectName("mixerStrip")
         frame.setMinimumWidth(130)
         layout = QtWidgets.QVBoxLayout(frame)
         layout.setSpacing(8)
         layout.setContentsMargins(10, 10, 10, 10)
 
-        # Track title
-        title = QtWidgets.QLabel(f"Track {track_idx + 1}")
-        title.setAlignment(QtCore.Qt.AlignCenter)
-        title.setStyleSheet(f"font-weight: bold; font-size: 13px; color: {color};")
+        # Track title — double-click to rename (Ableton-style)
+        title = TrackNameEdit(f"Track {track_idx + 1}")
+        title.setStyleSheet(self._title_style(color))
+        title.renamed.connect(lambda: self.track_names_changed.emit())
         layout.addWidget(title)
 
         # On/Off toggle
@@ -2905,30 +3057,39 @@ class MixerStripView(QtWidgets.QWidget):
         on_btn.toggled.connect(lambda checked, b=on_btn, c=color: self._on_toggle(b, checked, c))
         layout.addWidget(on_btn)
 
-        # Mono/Stereo toggle
+        # Mono/Stereo toggle — a quiet mode switch (text shows the mode),
+        # not an accent-colored state button
         stereo_btn = QtWidgets.QPushButton("STEREO")
         stereo_btn.setCheckable(True)
         stereo_btn.setChecked(True)  # default stereo
+        stereo_btn.setProperty("quiet", True)
         stereo_btn.toggled.connect(lambda checked, b=stereo_btn: self._stereo_toggle(b, checked))
         layout.addWidget(stereo_btn)
 
-        # Volume knob
+        # Volume knob — static header, live value below the knob
         vol_label = QtWidgets.QLabel("Volume")
         vol_label.setAlignment(QtCore.Qt.AlignCenter)
+        vol_label.setStyleSheet("font-size: 11px;")
         layout.addWidget(vol_label)
 
-        dial = QtWidgets.QDial()
+        dial = MiniKnob()
         dial.setRange(0, 100)
         dial.setValue(100)
-        dial.setNotchesVisible(True)
+        dial.set_default_value(100)
+        dial.set_accent_color(color)
         dial.setFixedSize(80, 80)
-        dial.valueChanged.connect(lambda v, lbl=vol_label: lbl.setText(f"Vol: {v}%"))
-        dial.valueChanged.connect(lambda: self.mapping_changed.emit())
         dial_container = QtWidgets.QHBoxLayout()
         dial_container.addStretch()
         dial_container.addWidget(dial)
         dial_container.addStretch()
         layout.addLayout(dial_container)
+
+        vol_val = QtWidgets.QLabel("100%")
+        vol_val.setAlignment(QtCore.Qt.AlignCenter)
+        vol_val.setStyleSheet("font-size: 11px;")
+        layout.addWidget(vol_val)
+        dial.valueChanged.connect(lambda v, lbl=vol_val: lbl.setText(f"{v}%"))
+        dial.valueChanged.connect(lambda: self.mapping_changed.emit())
 
         # Input selector
         input_label = QtWidgets.QLabel("Input:")
@@ -2949,9 +3110,14 @@ class MixerStripView(QtWidgets.QWidget):
             'stereo_btn': stereo_btn,
             'dial': dial,
             'vol_label': vol_label,
+            'vol_val': vol_val,
             'input_combo': input_combo,
             'track_idx': track_idx,
         }
+
+    def _title_style(self, color):
+        return (f"font-weight: bold; font-size: 13px; color: {color}; "
+                f"background: transparent; border: none;")
 
     def _toggle_style(self, is_on, color):
         if is_on:
@@ -2967,18 +3133,36 @@ class MixerStripView(QtWidgets.QWidget):
         btn.setText("STEREO" if checked else "MONO")
         self.mapping_changed.emit()
 
+    def _sync_strip_visuals(self, strip):
+        """Make button text/style match the checked state.
+
+        Required after any setChecked() done with signals blocked (e.g.
+        auto_assign_devices) — otherwise a strip can SAY "MONO" while its
+        internal state (what get_mapping reads) is stereo.
+        """
+        color = self.get_track_color(strip['track_idx'])
+        on = strip['on_btn'].isChecked()
+        strip['on_btn'].setText("ON" if on else "OFF")
+        strip['on_btn'].setStyleSheet(self._toggle_style(on, color))
+        strip['stereo_btn'].setText(
+            "STEREO" if strip['stereo_btn'].isChecked() else "MONO")
+
     def _populate_input_combo(self, combo):
-        """Populate a single input combo with stereo pairs."""
+        """Populate a single input combo with stereo pairs, labeled by device name."""
         combo.clear()
         offset = 0
         for info in self.input_infos:
-            dev_label = info['label']
+            name = info.get('name') or info['label']
             ch = info['channels']
             num_pairs = max(1, ch // 2)
             for p in range(num_pairs):
-                ch_lo = p * 2 + 1
-                ch_hi = ch_lo + 1
-                combo.addItem(f"{dev_label} {ch_lo}-{ch_hi}", offset + p * 2)
+                if num_pairs == 1:
+                    # Single stereo pair — the device name says it all
+                    combo.addItem(name, offset)
+                else:
+                    ch_lo = p * 2 + 1
+                    ch_hi = ch_lo + 1
+                    combo.addItem(f"{name} {ch_lo}/{ch_hi}", offset + p * 2)
             offset += ch
 
     def update_for_inputs(self, input_infos):
@@ -2986,8 +3170,9 @@ class MixerStripView(QtWidgets.QWidget):
         self.input_infos = input_infos
         labels = []
         for info in input_infos:
+            name = info.get('name') or info['label']
             for ch in range(info['channels']):
-                labels.append(f"{info['label']}{ch+1}")
+                labels.append(f"{name} {ch+1}")
         self.input_channel_count = len(labels)
         self.input_labels = labels
         for strip in self.strips:
@@ -3058,6 +3243,7 @@ class MixerStripView(QtWidgets.QWidget):
                         if isinstance(r_src, dict):
                             r_idx = r_src.get('index', 0)
                             strip['stereo_btn'].setChecked(r_idx != idx)
+            self._sync_strip_visuals(strip)
 
     def auto_assign_devices(self, input_infos, num_output_tracks=4):
         """Auto-assign each input device to its own track strip."""
@@ -3082,6 +3268,7 @@ class MixerStripView(QtWidgets.QWidget):
                 strip['on_btn'].setChecked(True)
                 strip['stereo_btn'].setChecked(True)
                 strip['dial'].setValue(100)
+                strip['vol_val'].setText("100%")  # signals are blocked here
                 ch_offset += info['channels']
         finally:
             for s in self.strips:
@@ -3089,6 +3276,9 @@ class MixerStripView(QtWidgets.QWidget):
                 s['on_btn'].blockSignals(False)
                 s['stereo_btn'].blockSignals(False)
                 s['dial'].blockSignals(False)
+                # setChecked above ran with signals blocked, so the
+                # text-updating handlers never fired — re-sync manually
+                self._sync_strip_visuals(s)
             self.blockSignals(False)
         # Emit once after all changes
         self.mapping_changed.emit()
@@ -3096,11 +3286,23 @@ class MixerStripView(QtWidgets.QWidget):
     def get_track_color(self, track_idx):
         return self._track_colors[track_idx % len(self._track_colors)]
 
+    def get_track_names(self):
+        """Current track names, e.g. ['Drums', 'Track 2', ...]."""
+        return [strip['title'].text() for strip in self.strips]
+
+    def set_track_names(self, names):
+        """Restore track names (e.g. from a preset). Empty entries keep defaults."""
+        for strip, name in zip(self.strips, names or []):
+            if name and isinstance(name, str):
+                strip['title'].setText(name)
+        self.track_names_changed.emit()
+
     def _refresh_track_colors(self):
         for strip in self.strips:
             i = strip['track_idx']
             color = self.get_track_color(i)
-            strip['title'].setStyleSheet(f"font-weight: bold; font-size: 13px; color: {color};")
+            strip['title'].setStyleSheet(self._title_style(color))
+            strip['dial'].set_accent_color(color)
             if strip['on_btn'].isChecked():
                 strip['on_btn'].setStyleSheet(self._toggle_style(True, color))
 
@@ -3112,7 +3314,7 @@ class SamplePlayerWidget(QtWidgets.QGroupBox):
     slot_changed = Signal()    # emits when input slot assignment changes
 
     def __init__(self, parent=None):
-        super().__init__("Lazy Sample Loader", parent)
+        super().__init__("Sample Player", parent)
         self.player = SampleFilePlayer()
         self._build_ui()
 
@@ -3155,10 +3357,10 @@ class SamplePlayerWidget(QtWidgets.QGroupBox):
         # Row 2: Input slot selector + duration label
         layout.addWidget(QtWidgets.QLabel("Route to:"), 2, 0)
         self.slot_combo = QtWidgets.QComboBox()
-        self.slot_combo.addItem("-- Off --", None)
-        self.slot_combo.addItem("Input A", "A")
-        self.slot_combo.addItem("Input B", "B")
-        self.slot_combo.addItem("Input C", "C")
+        self.slot_combo.addItem("Off", None)
+        self.slot_combo.addItem("IN A", "A")
+        self.slot_combo.addItem("IN B", "B")
+        self.slot_combo.addItem("IN C", "C")
         self.slot_combo.setCurrentIndex(1)  # Default to Input A
         self.slot_combo.setEnabled(False)
         self.slot_combo.currentIndexChanged.connect(lambda: self.slot_changed.emit())
@@ -3274,12 +3476,15 @@ class MainWindow(QtWidgets.QMainWindow):
         # Menu bar
         menubar = self.menuBar()
 
-        # File menu — Presets
+        # File menu — Presets + Recordings
         file_menu = menubar.addMenu("File")
         save_preset_action = file_menu.addAction("Save Preset...")
         save_preset_action.triggered.connect(self._save_preset_dialog)
         load_preset_action = file_menu.addAction("Load Preset...")
         load_preset_action.triggered.connect(self._load_preset_dialog)
+        file_menu.addSeparator()
+        recordings_action = file_menu.addAction("Open Recordings Folder")
+        recordings_action.triggered.connect(self._open_recordings_folder)
 
         # View > Theme
         view_menu = menubar.addMenu("View")
@@ -3335,32 +3540,46 @@ class MainWindow(QtWidgets.QMainWindow):
         right_layout.setSpacing(12)
         
         # Device selection — symmetric inputs (left) and outputs (right)
-        device_group = QtWidgets.QGroupBox("Audio Devices")
+        # QSS has no text-transform — section titles are uppercased here
+        # (Ableton-style section headers)
+        device_group = QtWidgets.QGroupBox("AUDIO DEVICES")
         device_layout = QtWidgets.QGridLayout()
         device_layout.setSpacing(10)
         device_layout.setColumnStretch(1, 1)  # input combos
         device_layout.setColumnStretch(3, 1)  # output combos
 
+        # User-defined device display names (Logic-style "I/O Labels").
+        # Maps full PortAudio device name -> custom short name.
+        self.device_aliases = self._load_device_aliases()
+
+        _rename_tip = "Double-click to rename the selected device"
+
         # -- Inputs (left) --
         # Input A (always active)
-        self._input_a_label = QtWidgets.QLabel("Input A:")
+        self._input_a_label = ClickableLabel("IN A")
         self._input_a_label.setStyleSheet("font-weight: bold; color: #4B9DE0;")
+        self._input_a_label.setToolTip(_rename_tip)
+        self._input_a_label.doubleClicked.connect(lambda: self._rename_slot_device('input', 'A'))
         device_layout.addWidget(self._input_a_label, 0, 0)
         self.input_combo_a = QtWidgets.QComboBox()
         self.input_combo_a.currentIndexChanged.connect(self.input_device_changed)
         device_layout.addWidget(self.input_combo_a, 0, 1)
 
         # Input B (optional)
-        self._input_b_label = QtWidgets.QLabel("Input B:")
+        self._input_b_label = ClickableLabel("IN B")
         self._input_b_label.setStyleSheet("font-weight: bold; color: #50C878;")
+        self._input_b_label.setToolTip(_rename_tip)
+        self._input_b_label.doubleClicked.connect(lambda: self._rename_slot_device('input', 'B'))
         device_layout.addWidget(self._input_b_label, 1, 0)
         self.input_combo_b = QtWidgets.QComboBox()
         self.input_combo_b.currentIndexChanged.connect(self.input_device_changed)
         device_layout.addWidget(self.input_combo_b, 1, 1)
 
         # Input C (optional)
-        self._input_c_label = QtWidgets.QLabel("Input C:")
+        self._input_c_label = ClickableLabel("IN C")
         self._input_c_label.setStyleSheet("font-weight: bold; color: #E6A23C;")
+        self._input_c_label.setToolTip(_rename_tip)
+        self._input_c_label.doubleClicked.connect(lambda: self._rename_slot_device('input', 'C'))
         device_layout.addWidget(self._input_c_label, 2, 0)
         self.input_combo_c = QtWidgets.QComboBox()
         self.input_combo_c.currentIndexChanged.connect(self.input_device_changed)
@@ -3368,8 +3587,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # -- Outputs (right) — same color scheme as inputs --
         # Output A (always active)
-        self._out_a_label = QtWidgets.QLabel("Output A:")
+        self._out_a_label = ClickableLabel("OUT A")
         self._out_a_label.setStyleSheet("font-weight: bold; color: #4B9DE0;")
+        self._out_a_label.setToolTip(_rename_tip)
+        self._out_a_label.doubleClicked.connect(lambda: self._rename_slot_device('output', 'A'))
         device_layout.addWidget(self._out_a_label, 0, 2)
         self.output_combo_a = QtWidgets.QComboBox()
         self.output_combo_a.currentIndexChanged.connect(lambda: self.output_device_changed('A'))
@@ -3378,8 +3599,10 @@ class MainWindow(QtWidgets.QMainWindow):
         device_layout.addWidget(self.channels_combo_a, 0, 4)
 
         # Output B (optional)
-        self._out_b_label = QtWidgets.QLabel("Output B:")
+        self._out_b_label = ClickableLabel("OUT B")
         self._out_b_label.setStyleSheet("font-weight: bold; color: #50C878;")
+        self._out_b_label.setToolTip(_rename_tip)
+        self._out_b_label.doubleClicked.connect(lambda: self._rename_slot_device('output', 'B'))
         device_layout.addWidget(self._out_b_label, 1, 2)
         self.output_combo_b = QtWidgets.QComboBox()
         self.output_combo_b.currentIndexChanged.connect(lambda: self.output_device_changed('B'))
@@ -3388,8 +3611,10 @@ class MainWindow(QtWidgets.QMainWindow):
         device_layout.addWidget(self.channels_combo_b, 1, 4)
 
         # Output C (optional)
-        self._out_c_label = QtWidgets.QLabel("Output C:")
+        self._out_c_label = ClickableLabel("OUT C")
         self._out_c_label.setStyleSheet("font-weight: bold; color: #E6A23C;")
+        self._out_c_label.setToolTip(_rename_tip)
+        self._out_c_label.doubleClicked.connect(lambda: self._rename_slot_device('output', 'C'))
         device_layout.addWidget(self._out_c_label, 2, 2)
         self.output_combo_c = QtWidgets.QComboBox()
         self.output_combo_c.currentIndexChanged.connect(lambda: self.output_device_changed('C'))
@@ -3418,6 +3643,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.record_btn = QtWidgets.QPushButton("Record")
         self.record_btn.setCheckable(True)
         self.record_btn.setEnabled(False)
+        self.record_btn.setToolTip(
+            "Record track stems + output mixes as WAV\n"
+            "Saves to ~/Music/LF Music Mapper (enabled while routing)")
         self.record_btn.toggled.connect(self._toggle_recording)
         device_layout.addWidget(self.record_btn, 3, 4)
 
@@ -3450,18 +3678,19 @@ class MainWindow(QtWidgets.QMainWindow):
         device_group.setLayout(device_layout)
         left_layout.addWidget(device_group)
 
-        # Sample player widget
+        # Sample player widget (lives in a section tab; title comes from
+        # the tab, so the group box title would be redundant)
         self.sample_player_widget = SamplePlayerWidget()
+        self.sample_player_widget.setTitle("")
         self.sample_player_widget.slot_changed.connect(self._on_sample_slot_changed)
         self.sample_player_widget.file_loaded.connect(self._on_sample_file_loaded)
-        left_layout.addWidget(self.sample_player_widget)
 
         # Enable drag-and-drop for audio files
         self.setAcceptDrops(True)
 
-        # Per-output track mapping via tabs
-        mapper_group = QtWidgets.QGroupBox("Track Routing")
-        mapper_layout = QtWidgets.QVBoxLayout()
+        # Per-output track mapping (one page of the section tabs)
+        routing_page = QtWidgets.QWidget()
+        mapper_layout = QtWidgets.QVBoxLayout(routing_page)
         mapper_layout.setContentsMargins(10, 10, 10, 10)
         mapper_layout.setSpacing(8)
 
@@ -3506,13 +3735,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         mixer_a = MixerStripView()
         mixer_a.mapping_changed.connect(lambda: self.apply_mapping(0))
+        mixer_a.track_names_changed.connect(lambda s='A': self._sync_track_names(s))
         self.mixer_views['A'] = mixer_a
         self.mixer_tabs.addTab(mixer_a, "Output A")
 
         mapper_layout.addWidget(self.mapper_tabs)
         mapper_layout.addWidget(self.mixer_tabs)
-        mapper_group.setLayout(mapper_layout)
-        left_layout.addWidget(mapper_group)
+        mapper_layout.addStretch()
 
         # Effects rack (integrated from effects.py)
         self.effects_rack = None
@@ -3520,18 +3749,29 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 from effects import EffectsRackWidget
                 self.effects_rack = EffectsRackWidget(
-                    self.audio_manager.effects_engine)
-                left_layout.addWidget(self.effects_rack)
+                    self.audio_manager.effects_engine, embedded=True)
                 # Apply initial track colors
                 tc = THEMES[self._current_theme]['palette']['track_colors']
                 self.effects_rack.update_track_colors(tc)
             except Exception as e:
                 dbg(f"Effects rack init failed: {e}")
 
+        # ── Section tabs: Track Routing / Effects / Sample Player ──
+        # Routing and effects are never needed at the same moment, so they
+        # share one tabbed area instead of stacking (no vertical scrolling)
+        self.section_tabs = QtWidgets.QTabWidget()
+        self.section_tabs.addTab(routing_page, "Track Routing")
+        if self.effects_rack is not None:
+            self._effects_tab_idx = self.section_tabs.addTab(
+                self.effects_rack, "Effects")
+            self.effects_rack.rack_changed.connect(self._update_effects_tab_label)
+        self.section_tabs.addTab(self.sample_player_widget, "Sample Player")
+        left_layout.addWidget(self.section_tabs)
+
         left_layout.addStretch()
         
         # Visualization area
-        viz_group = QtWidgets.QGroupBox("Audio Visualization")
+        viz_group = QtWidgets.QGroupBox("MONITORING")
         viz_layout = QtWidgets.QVBoxLayout()
         
         # Create enhanced visualization widgets
@@ -3592,10 +3832,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._track_label_states = []  # track previous state to avoid redundant updates
         for i in range(4):
-            label = QtWidgets.QLabel(f"Track {i+1}: Silent")
-            label.setStyleSheet(f"color: {self.get_track_color(i)}; font-weight: bold; padding: 8px 12px; border-radius: 3px; background-color: {THEMES[self._current_theme]['palette']['bg_primary']};")
+            label = QtWidgets.QLabel(f"Track {i+1}")
+            label.setAlignment(QtCore.Qt.AlignCenter)
+            label.setStyleSheet(f"color: {self.get_track_color(i)}; font-weight: bold; padding: 8px 6px; border-radius: 3px; background-color: {THEMES[self._current_theme]['palette']['bg_primary']};")
             label.setMinimumHeight(30)
-            label.setMinimumWidth(140)
+            label.setMinimumWidth(80)
             label.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
             track_row.addWidget(label)
             self.track_labels.append(label)
@@ -3753,7 +3994,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 # Live device selected — always include it
                 channels = int(self.device_map[dev_idx]['inputs'])
                 infos.append({'label': label, 'channels': channels,
-                              'index': dev_idx, 'is_sample': False})
+                              'index': dev_idx, 'is_sample': False,
+                              'name': self.device_display_name(
+                                  self.device_map[dev_idx]['name'], max_len=12)})
             elif (sample_slot == label
                   and self.sample_player_widget.player.audio_data is not None):
                 # No live device, but sample player assigned — sample is sole input
@@ -3762,6 +4005,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     'channels': self.sample_player_widget.player.channels,
                     'index': -1,
                     'is_sample': True,
+                    'name': 'Sample',
                 })
         return infos
 
@@ -3821,7 +4065,9 @@ class MainWindow(QtWidgets.QMainWindow):
                         self.mixer_views[slot].auto_assign_devices(input_infos, num_tracks)
 
             # Update status message
-            device_summary = ", ".join(f"{info['label']}({info['channels']}ch)" for info in input_infos)
+            device_summary = ", ".join(
+                f"{info.get('name') or info['label']} ({info['channels']}ch)"
+                for info in input_infos)
             self.statusBar().showMessage(f"Inputs: {device_summary} = {total_channels} total channels")
         finally:
             self._updating_inputs = False
@@ -3871,24 +4117,173 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._track_label_states[i] = state
                     color = self.get_track_color(i)
                     pal = THEMES[self._current_theme]['palette']
-                    if state == "active":
-                        self.track_labels[i].setText(f"Track {i+1}: Active")
-                        self.track_labels[i].setStyleSheet(f"color: {color}; font-weight: bold; padding: 5px; border-radius: 3px; background-color: {pal['signal_active_bg']};")
-                    elif state == "low":
-                        self.track_labels[i].setText(f"Track {i+1}: Low signal")
-                        self.track_labels[i].setStyleSheet(f"color: {color}; font-weight: bold; padding: 5px; border-radius: 3px; background-color: {pal['signal_low_bg']};")
-                    else:
-                        self.track_labels[i].setText(f"Track {i+1}: Silent")
-                        self.track_labels[i].setStyleSheet(f"color: {color}; font-weight: bold; padding: 5px; border-radius: 3px; background-color: {pal['bg_primary']};")
+                    # Name only — the background tint shows signal state
+                    # (Logic-style); details live in the tooltip. Elide so
+                    # long names never overflow the chip.
+                    track_name = self._track_display_name(i)
+                    lbl = self.track_labels[i]
+                    fm = lbl.fontMetrics()
+                    lbl.setText(fm.elidedText(track_name, QtCore.Qt.ElideRight,
+                                              max(40, lbl.width() - 16)))
+                    state_word = {"active": "Active", "low": "Low signal"}.get(state, "Silent")
+                    lbl.setToolTip(f"{track_name} — {state_word}")
+                    bg = {"active": pal['signal_active_bg'],
+                          "low": pal['signal_low_bg']}.get(state, pal['bg_primary'])
+                    lbl.setStyleSheet(f"color: {color}; font-weight: bold; padding: 5px; border-radius: 3px; background-color: {bg};")
     
+    # ── Device display names (Logic-style I/O labels) ──────────────────
+
+    ALIASES_FILE = os.path.join(os.path.expanduser('~'), '.lf_music_mapper', 'device_names.json')
+
+    def _load_device_aliases(self):
+        """Load user-defined device display names from disk."""
+        try:
+            with open(self.ALIASES_FILE, 'r') as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items() if v}
+        except (OSError, ValueError):
+            pass
+        return {}
+
+    def _save_device_aliases(self):
+        try:
+            os.makedirs(os.path.dirname(self.ALIASES_FILE), exist_ok=True)
+            with open(self.ALIASES_FILE, 'w') as f:
+                json.dump(self.device_aliases, f, indent=2)
+        except OSError as e:
+            dbg(f"Could not save device names: {e}")
+
+    def device_display_name(self, device_name, max_len=16):
+        """Display name for a device: user alias if set, else auto-shortened."""
+        alias = self.device_aliases.get(device_name)
+        if alias:
+            if len(alias) > max_len:
+                return alias[:max_len - 1].rstrip() + '…'
+            return alias
+        return short_device_name(device_name, max_len)
+
+    def _rename_slot_device(self, kind, slot):
+        """Double-click on an IN/OUT label: rename the device selected in that slot."""
+        combos = {
+            ('input', 'A'): self.input_combo_a, ('input', 'B'): self.input_combo_b,
+            ('input', 'C'): self.input_combo_c, ('output', 'A'): self.output_combo_a,
+            ('output', 'B'): self.output_combo_b, ('output', 'C'): self.output_combo_c,
+        }
+        combo = combos[(kind, slot)]
+        dev_idx = combo.currentData()
+        if dev_idx is None or dev_idx not in self.device_map:
+            self.statusBar().showMessage("Select a device first, then double-click to rename it")
+            return
+        full_name = self.device_map[dev_idx]['name']
+        current = self.device_aliases.get(full_name, short_device_name(full_name))
+        text, ok = QtWidgets.QInputDialog.getText(
+            self, "Rename Device",
+            f"Display name for:\n{full_name}", text=current)
+        if not ok:
+            return
+        text = text.strip()
+        if not text or text == short_device_name(full_name):
+            self.device_aliases.pop(full_name, None)
+        else:
+            self.device_aliases[full_name] = text
+        self._save_device_aliases()
+        self._refresh_display_names()
+        self.statusBar().showMessage(f"Device renamed: {self.device_display_name(full_name)}")
+
+    def _refresh_display_names(self):
+        """Re-apply display names to all combos, views, and tabs after a rename."""
+        combos = [
+            (self.input_combo_a, self._populate_input_combo, False),
+            (self.input_combo_b, self._populate_input_combo, True),
+            (self.input_combo_c, self._populate_input_combo, True),
+            (self.output_combo_a, self._populate_output_combo, False),
+            (self.output_combo_b, self._populate_output_combo, True),
+            (self.output_combo_c, self._populate_output_combo, True),
+        ]
+        for combo, populate, has_placeholder in combos:
+            prev = combo.currentData()
+            combo.blockSignals(True)
+            populate(combo, add_placeholder=has_placeholder)
+            idx = -1
+            if prev is not None:
+                idx = combo.findData(prev)
+            elif has_placeholder:
+                idx = 0
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+            combo.blockSignals(False)
+        # Push new names into all routing views without touching the mapping
+        input_infos = self.get_input_infos()
+        if input_infos:
+            for mapper in self.track_mappers.values():
+                mapper.update_for_inputs(input_infos)
+            for mixer in self.mixer_views.values():
+                mixer.update_for_inputs(input_infos)
+        self._update_output_tab_titles()
+
+    def _update_output_tab_titles(self):
+        """Show the routed device on each output tab, e.g. 'A · S-4'."""
+        for slot in ('A', 'B', 'C'):
+            dev_combo, _ = self._get_output_combos(slot)
+            dev_idx = dev_combo.currentData()
+            if dev_idx is not None and dev_idx in self.device_map:
+                title = f"{slot} · {self.device_display_name(self.device_map[dev_idx]['name'])}"
+            else:
+                title = f"Output {slot}"
+            for tabs, views in ((self.mapper_tabs, self.track_mappers),
+                                (self.mixer_tabs, self.mixer_views)):
+                view = views.get(slot)
+                if view is not None:
+                    idx = tabs.indexOf(view)
+                    if idx >= 0:
+                        tabs.setTabText(idx, title)
+
+    def _sync_track_names(self, slot):
+        """Propagate mixer track renames to the patchbay, meters, and status labels."""
+        mixer = self.mixer_views.get(slot)
+        if not mixer:
+            return
+        names = mixer.get_track_names()
+        if slot in self.track_mappers:
+            self.track_mappers[slot].set_track_names(names)
+        if slot == 'A' and hasattr(self, 'level_meters'):
+            self.level_meters.set_track_names(names)
+            # Force status labels to re-render with the new names
+            self._track_label_states = [None] * len(self._track_label_states)
+
+    def _update_effects_tab_label(self):
+        """Show the active-effect count on the Effects tab ('Effects · 2')."""
+        if self.effects_rack is None or not hasattr(self, 'section_tabs'):
+            return
+        count = self.effects_rack.active_count()
+        self.section_tabs.setTabText(
+            self._effects_tab_idx, f"Effects · {count}" if count else "Effects")
+
+    def _track_display_name(self, i):
+        """Name shown in the per-track status labels (custom name from mixer A)."""
+        mixer = self.mixer_views.get('A')
+        if mixer:
+            names = mixer.get_track_names()
+            if i < len(names) and names[i]:
+                return names[i]
+        return f"Track {i+1}"
+
     def _populate_input_combo(self, combo, add_placeholder=False):
         """Populate an input combo with available input devices."""
         combo.blockSignals(True)
         combo.clear()
         if add_placeholder:
-            combo.addItem("-- Off --", None)
+            combo.addItem("No Device", None)
         for device in self._cached_input_devices:
-            combo.addItem(f"{device['name']} ({device['inputs']}ch, {int(device['rate'])}Hz)", device['index'])
+            row = combo.count()
+            combo.addItem(
+                f"{self.device_display_name(device['name'], max_len=28)}  ·  {device['inputs']} in",
+                device['index'])
+            combo.setItemData(
+                row,
+                f"{device['name']} — {device['inputs']} inputs, {int(device['rate'])} Hz",
+                QtCore.Qt.ToolTipRole)
         combo.blockSignals(False)
 
     def _populate_output_combo(self, combo, add_placeholder=False):
@@ -3896,9 +4291,16 @@ class MainWindow(QtWidgets.QMainWindow):
         combo.blockSignals(True)
         combo.clear()
         if add_placeholder:
-            combo.addItem("-- Off --", None)
+            combo.addItem("No Device", None)
         for device in self._cached_output_devices:
-            combo.addItem(f"{device['name']} ({device['outputs']}ch, {int(device['rate'])}Hz)", device['index'])
+            row = combo.count()
+            combo.addItem(
+                f"{self.device_display_name(device['name'], max_len=28)}  ·  {device['outputs']} out",
+                device['index'])
+            combo.setItemData(
+                row,
+                f"{device['name']} — {device['outputs']} outputs, {int(device['rate'])} Hz",
+                QtCore.Qt.ToolTipRole)
         combo.blockSignals(False)
 
     def refresh_devices(self):
@@ -3930,16 +4332,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self._populate_output_combo(self.output_combo_b, add_placeholder=True)
         self._populate_output_combo(self.output_combo_c, add_placeholder=True)
 
-        # Auto-select S4 on Output A if found
-        for i in range(self.output_combo_a.count()):
-            if "S4" in self.output_combo_a.itemText(i) or "S-4" in self.output_combo_a.itemText(i):
-                self.output_combo_a.setCurrentIndex(i)
+        # Auto-select S4 on Output A if found (match on real device name,
+        # not the displayed alias)
+        for dev in self._cached_output_devices:
+            if "S4" in dev['name'] or "S-4" in dev['name']:
+                idx = self.output_combo_a.findData(dev['index'])
+                if idx >= 0:
+                    self.output_combo_a.setCurrentIndex(idx)
                 break
 
         # Auto-select Digitakt on Input A if found
-        for i in range(self.input_combo_a.count()):
-            if "Digitakt" in self.input_combo_a.itemText(i):
-                self.input_combo_a.setCurrentIndex(i)
+        for dev in self._cached_input_devices:
+            if "Digitakt" in dev['name']:
+                idx = self.input_combo_a.findData(dev['index'])
+                if idx >= 0:
+                    self.input_combo_a.setCurrentIndex(idx)
                 break
 
         # Update channel combos for initially selected outputs
@@ -3990,12 +4397,13 @@ class MainWindow(QtWidgets.QMainWindow):
             # Add options in pairs for stereo tracks up to 8 channels
             for i in range(1, min(5, (max_channels // 2) + 1)):
                 channels = i * 2
-                ch_combo.addItem(f"{channels} channels ({i} tracks)", channels)
+                ch_combo.addItem(f"{i} track ({channels} ch)" if i == 1
+                                 else f"{i} tracks ({channels} ch)", channels)
                 has_stereo = True
 
             # If no stereo options were added, add mono option
             if not has_stereo and max_channels > 0:
-                ch_combo.addItem(f"{max_channels} channel(s) (mono)", max_channels)
+                ch_combo.addItem(f"Mono ({max_channels} ch)", max_channels)
 
             # Set default selection to maximum available
             if ch_combo.count() > 0:
@@ -4017,6 +4425,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 # Add new mixer tab
                 mixer = MixerStripView()
                 mixer.mapping_changed.connect(lambda oi=out_idx: self.apply_mapping(oi))
+                mixer.track_names_changed.connect(lambda s=slot: self._sync_track_names(s))
                 self.mixer_views[slot] = mixer
                 self.mixer_tabs.addTab(mixer, f"Output {slot}")
                 # Initialize with current input info and auto-assign
@@ -4042,6 +4451,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     idx = self.mixer_tabs.indexOf(mixer)
                     if idx >= 0:
                         self.mixer_tabs.removeTab(idx)
+
+        # Tab titles show the actual device ("A · S-4")
+        if hasattr(self, 'mapper_tabs'):
+            self._update_output_tab_titles()
 
     
     def toggle_routing(self):
@@ -4087,7 +4500,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         self, "Duplicate Output Device",
                         f"'{name}' is selected for both Output {prev} and Output {od['label']}.\n\n"
                         f"Each output slot must use a different device.\n"
-                        f"Set one of them to '-- Off --' or choose a different device.")
+                        f"Set one of them to 'No Device' or choose a different device.")
                     return
                 seen_indices[od['index']] = od['label']
 
@@ -4193,13 +4606,16 @@ class MainWindow(QtWidgets.QMainWindow):
         mapping_str = ", ".join([
             f"{i//2+1}.{i%2+1}→{describe(m)}" for i, m in enumerate(mapping)
         ])
+        # Full detail goes to the status bar; the in-view label stays short
+        # and human-readable so it never overflows the card
         self.statusBar().showMessage(f"Output {label} mapping: {mapping_str}")
 
         # Apply to audio manager
         self.audio_manager.set_track_mapping(mapping, output_idx)
 
-        # Update the track mapper status
-        mapper.status_label.setText(f"Mapping applied: {mapping_str}")
+        routed = sum(1 for m in mapping if m)
+        mapper.status_label.setText(
+            f"Mapping applied — {routed} of {len(mapping)} channels routed")
     
     # ── Hot restart & sample player live switching ──────────────────────
 
@@ -4322,6 +4738,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if filepath.lower().endswith(SampleFilePlayer.SUPPORTED_EXTENSIONS):
                 sr = self.sample_rate_combo.currentData() or 48000
                 self.sample_player_widget.load_file(filepath, sr)
+                # Reveal the player so the drop has visible feedback
+                self.section_tabs.setCurrentWidget(self.sample_player_widget)
                 break
 
     # ── Preset save / load ──────────────────────────────────────────────
@@ -4370,6 +4788,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 mapper = self.track_mappers.get(slot)
             if mapper:
                 config['mappings'][slot] = mapper.get_mapping()
+        # Custom track names (owned by the mixer views)
+        config['track_names'] = {
+            slot: mixer.get_track_names()
+            for slot, mixer in self.mixer_views.items()
+        }
+        # Effects rack state (bpm, bypass, every slot's effect + params)
+        if self.audio_manager.effects_engine:
+            config['effects'] = self.audio_manager.effects_engine.get_state()
         return config
 
     def _apply_preset_config(self, config):
@@ -4456,6 +4882,20 @@ class MainWindow(QtWidgets.QMainWindow):
             if mapper and mapping:
                 mapper.set_mapping(mapping)
 
+        # Restore custom track names (emits track_names_changed → syncs
+        # patchbay headers, meters, and status labels)
+        for slot, names in (config.get('track_names') or {}).items():
+            mixer = self.mixer_views.get(slot)
+            if mixer and names:
+                mixer.set_track_names(names)
+
+        # Restore effects rack state and re-sync its UI
+        fx_state = config.get('effects')
+        if fx_state and self.audio_manager.effects_engine:
+            self.audio_manager.effects_engine.set_state(fx_state)
+            if self.effects_rack:
+                self.effects_rack.refresh_from_engine()
+
         if missing:
             QtWidgets.QMessageBox.warning(
                 self, "Missing Devices",
@@ -4508,10 +4948,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ── Stem recording ──────────────────────────────────────────────────
 
+    # DAW-standard location, visible in the Finder sidebar under Music
+    RECORDINGS_DIR = os.path.join(os.path.expanduser('~'), 'Music', 'LF Music Mapper')
+
+    def _open_recordings_folder(self):
+        os.makedirs(self.RECORDINGS_DIR, exist_ok=True)
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self.RECORDINGS_DIR))
+
     def _toggle_recording(self, checked):
         if checked:
             if not self.audio_manager.is_routing:
                 self.record_btn.setChecked(False)
+                self.statusBar().showMessage(
+                    "Start routing first — Record captures the live output")
                 return
             if not _HAS_SOUNDFILE:
                 QtWidgets.QMessageBox.warning(
@@ -4522,10 +4971,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             sample_rate = self.sample_rate_combo.currentData() or 48000
             output_devices = self.get_enabled_output_devices()
-            base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'recordings')
             recorder = StemRecorder()
             recorder.start(
-                base_dir, sample_rate,
+                self.RECORDINGS_DIR, sample_rate,
                 [(d['label'], d['channels']) for d in output_devices])
             self.audio_manager.recorder = recorder
             self.record_btn.setText("Stop Rec")
@@ -4543,6 +4991,25 @@ class MainWindow(QtWidgets.QMainWindow):
             self._record_blink_on = True
             if session_dir:
                 self.statusBar().showMessage(f"Recording saved to {session_dir}")
+                self._show_recording_saved_dialog(session_dir)
+
+    def _show_recording_saved_dialog(self, session_dir):
+        """Tell the user where the recording landed, with a Finder shortcut."""
+        try:
+            wavs = sorted(f for f in os.listdir(session_dir) if f.endswith('.wav'))
+        except OSError:
+            wavs = []
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Recording Saved")
+        box.setIcon(QtWidgets.QMessageBox.Information)
+        box.setText(f"Saved {len(wavs)} file{'s' if len(wavs) != 1 else ''}:")
+        box.setInformativeText(
+            "\n".join(wavs) + f"\n\n{session_dir}")
+        show_btn = box.addButton("Show in Finder", QtWidgets.QMessageBox.ActionRole)
+        box.addButton(QtWidgets.QMessageBox.Ok)
+        box.exec_()
+        if box.clickedButton() is show_btn:
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(session_dir))
 
     def _blink_record(self):
         if self.record_btn.isChecked():

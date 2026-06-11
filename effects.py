@@ -26,6 +26,14 @@ except ImportError:
         QtCore = QtWidgets = QtGui = None
         Signal = None
 
+if QtWidgets is not None:
+    try:
+        from widgets import MiniKnob
+    except ImportError:  # standalone use without widgets.py
+        MiniKnob = QtWidgets.QDial
+else:
+    MiniKnob = None
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Constants
@@ -1177,6 +1185,10 @@ class EffectsEngine:
         # Per-output bus effect
         self._bus_fx = [None] * num_outputs
 
+        # Smoothed per-output process() duration in ms (written from the
+        # audio callback thread, read by the UI — GIL-atomic floats)
+        self._load_ms = [0.0] * num_outputs
+
     # ── Configuration (main thread) ──
 
     def set_track_effect(self, out_idx, track_idx, effect_cls):
@@ -1235,6 +1247,80 @@ class EffectsEngine:
             if fx:
                 fx.reset()
 
+    # ── Serialization (presets / session restore) ──
+
+    @staticmethod
+    def _fx_state(fx):
+        """Serializable dict for one effect instance (None passes through)."""
+        if fx is None:
+            return None
+        return {
+            'type': fx.name,
+            'dry_wet': fx.dry_wet,
+            'sub_type': fx._sub_type,
+            'beat_frac': fx._beat_frac,
+            'params': {pd['key']: fx.get_param(pd['key'])
+                       for pd in fx.param_defs},
+        }
+
+    def _fx_from_state(self, state):
+        """Recreate an effect instance from _fx_state output (or None)."""
+        if not isinstance(state, dict):
+            return None
+        cls = next((c for c in EFFECT_CLASSES if c.name == state.get('type')), None)
+        if cls is None:
+            return None
+        fx = cls(sample_rate=self.sample_rate, buffer_size=self.buffer_size)
+        fx.set_bpm(self.bpm)
+        try:
+            fx.set_param('dry_wet', float(state.get('dry_wet', 0.5)))
+            sub = int(state.get('sub_type', 0))
+            if fx.sub_types and 0 <= sub < len(fx.sub_types):
+                fx.set_sub_type(sub)
+            fx.set_beat_fraction(float(state.get('beat_frac', 0.25)))
+            valid_keys = {pd['key'] for pd in fx.param_defs}
+            for key, val in (state.get('params') or {}).items():
+                if key in valid_keys:
+                    fx.set_param(key, float(val))
+        except (TypeError, ValueError):
+            pass
+        return fx
+
+    def get_state(self):
+        """Snapshot of the whole rack for presets: bpm, enabled, all slots."""
+        return {
+            'enabled': self.enabled,
+            'bpm': self.bpm,
+            'track_fx': [[self._fx_state(fx) for fx in out_slots]
+                         for out_slots in self._track_fx],
+            'bus_fx': [self._fx_state(fx) for fx in self._bus_fx],
+        }
+
+    def set_state(self, state):
+        """Restore a get_state() snapshot. Unknown effect types are skipped."""
+        if not isinstance(state, dict):
+            return
+        try:
+            self.bpm = max(1.0, float(state.get('bpm') or self.bpm))
+        except (TypeError, ValueError):
+            pass
+        self.enabled = bool(state.get('enabled', False))
+        track_fx = state.get('track_fx') or []
+        for oi in range(self.num_outputs):
+            slots = track_fx[oi] if oi < len(track_fx) else []
+            for ti in range(self.num_tracks):
+                st = slots[ti] if ti < len(slots) else None
+                self._track_fx[oi][ti] = self._fx_from_state(st)
+        bus_fx = state.get('bus_fx') or []
+        for oi in range(self.num_outputs):
+            self._bus_fx[oi] = self._fx_from_state(
+                bus_fx[oi] if oi < len(bus_fx) else None)
+
+    def has_any_effect(self):
+        """True if any track or bus slot holds an effect."""
+        return (any(fx for slots in self._track_fx for fx in slots)
+                or any(self._bus_fx))
+
     # ── Processing (audio callback thread) ──
 
     def process(self, out_idx, frames, num_channels):
@@ -1243,7 +1329,10 @@ class EffectsEngine:
         Called from the output callback between mapping and soft-clip.
         """
         if not self.enabled:
+            if out_idx < len(self._load_ms):
+                self._load_ms[out_idx] = 0.0
             return frames
+        _t0 = _time.perf_counter()
 
         # Per-track effects (one effect per stereo pair)
         if out_idx < len(self._track_fx):
@@ -1309,7 +1398,21 @@ class EffectsEngine:
         # feedback paths and producing high-frequency artifacts
         frames[np.abs(frames) < 1e-8] = 0.0
 
+        # Smoothed DSP load (EMA over ~10 callbacks)
+        if out_idx < len(self._load_ms):
+            dt_ms = (_time.perf_counter() - _t0) * 1000.0
+            self._load_ms[out_idx] = self._load_ms[out_idx] * 0.9 + dt_ms * 0.1
+
         return frames
+
+    def get_load_pct(self, out_idx):
+        """Effects DSP load as a percentage of the callback time budget."""
+        if not (0 <= out_idx < len(self._load_ms)) or self.sample_rate <= 0:
+            return 0.0
+        budget_ms = self.buffer_size / float(self.sample_rate) * 1000.0
+        if budget_ms <= 0:
+            return 0.0
+        return min(999.0, self._load_ms[out_idx] / budget_ms * 100.0)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1367,8 +1470,12 @@ if QtWidgets is not None:
             self._fx = None
             self._updating = False
 
+            # Card look (styled via QSS #fxSlot rule)
+            self.setObjectName("fxSlot")
+            self.setAttribute(QtCore.Qt.WA_StyledBackground, True)
+
             layout = QtWidgets.QVBoxLayout(self)
-            layout.setContentsMargins(4, 4, 4, 4)
+            layout.setContentsMargins(6, 6, 6, 6)
             layout.setSpacing(3)
 
             # Header label
@@ -1400,11 +1507,12 @@ if QtWidgets is not None:
             # Dry/Wet knob
             dw_row = QtWidgets.QVBoxLayout()
             dw_row.setSpacing(1)
-            self.dw_dial = QtWidgets.QDial()
+            self.dw_dial = MiniKnob()
             self.dw_dial.setRange(0, 1000)
             self.dw_dial.setValue(500)
+            if hasattr(self.dw_dial, 'set_default_value'):
+                self.dw_dial.set_default_value(500)
             self.dw_dial.setFixedSize(48, 48)
-            self.dw_dial.setNotchesVisible(True)
             self.dw_dial.valueChanged.connect(self._on_dw_changed)
             dw_lbl = QtWidgets.QLabel("D/W")
             dw_lbl.setAlignment(QtCore.Qt.AlignCenter)
@@ -1424,11 +1532,10 @@ if QtWidgets is not None:
             for i in range(2):
                 row = QtWidgets.QVBoxLayout()
                 row.setSpacing(1)
-                dial = QtWidgets.QDial()
+                dial = MiniKnob()
                 dial.setRange(0, 1000)
                 dial.setValue(500)
                 dial.setFixedSize(48, 48)
-                dial.setNotchesVisible(True)
                 dial.valueChanged.connect(lambda v, idx=i: self._on_param_changed(idx, v))
                 plbl = QtWidgets.QLabel("---")
                 plbl.setAlignment(QtCore.Qt.AlignCenter)
@@ -1504,12 +1611,16 @@ if QtWidgets is not None:
                     self._param_dials[i].setEnabled(False)
                 self.dw_dial.setEnabled(False)
                 self.freeze_btn.setEnabled(False)
+                self.freeze_btn.setChecked(False)
+                self.dw_val_lbl.setText("")
                 self._updating = False
                 return
 
             self.dw_dial.setEnabled(True)
             self.dw_dial.setValue(int(fx.dry_wet * 1000))
+            self.dw_val_lbl.setText(f"{int(fx.dry_wet * 100)}%")
             self.freeze_btn.setEnabled(True)
+            self.freeze_btn.setChecked(bool(fx.freeze))
 
             # Sub-types
             if fx.sub_types:
@@ -1521,8 +1632,11 @@ if QtWidgets is not None:
             else:
                 self.sub_combo.hide()
 
-            # Beat sync
+            # Beat sync — select the closest fraction to the effect's state
             if fx.has_beat_sync:
+                closest = min(range(len(BEAT_FRACTIONS)),
+                              key=lambda i: abs(BEAT_FRACTIONS[i][1] - fx._beat_frac))
+                self.beat_combo.setCurrentIndex(closest)
                 self.beat_combo.show()
             else:
                 self.beat_combo.hide()
@@ -1535,6 +1649,9 @@ if QtWidgets is not None:
                     self._param_dials[i].setEnabled(True)
                     val = fx.get_param(pd['key'])
                     self._param_dials[i].setValue(_value_to_knob(val, pd))
+                    if hasattr(self._param_dials[i], 'set_default_value'):
+                        self._param_dials[i].set_default_value(
+                            _value_to_knob(pd['default'], pd))
                     self._param_val_labels[i].setText(_fmt_value(val, pd))
                 else:
                     self._param_labels[i].setText("---")
@@ -1578,6 +1695,10 @@ if QtWidgets is not None:
         def update_header_color(self, color_str):
             self._header.setStyleSheet(
                 f"font-weight: bold; font-size: 11px; color: {color_str};")
+            # Match the knobs to the track color
+            for dial in (self.dw_dial, *self._param_dials):
+                if hasattr(dial, 'set_accent_color'):
+                    dial.set_accent_color(color_str)
 
         def sync_from_engine(self):
             """Re-read effect state (e.g. after output tab switch)."""
@@ -1596,19 +1717,49 @@ if QtWidgets is not None:
 
 
     class EffectsRackWidget(QtWidgets.QGroupBox):
-        """Full effects rack: BPM control, 4 track slots + 1 bus slot."""
+        """Full effects rack: BPM control, 4 track slots + 1 bus slot.
 
-        def __init__(self, engine, parent=None):
-            super().__init__("Effects", parent)
+        Standalone: collapsible — the slot strip hides behind a disclosure
+        header so the rack stays out of the way until effects are in use.
+        Embedded (embedded=True, e.g. inside a section tab): always
+        expanded, disclosure header hidden — the tab provides the title.
+        """
+
+        rack_changed = Signal()  # emitted when any slot's effect changes
+
+        def __init__(self, engine, parent=None, embedded=False):
+            # No group-box title — the disclosure button IS the header
+            super().__init__("", parent)
             self.engine = engine
+            self._embedded = embedded
 
             root = QtWidgets.QVBoxLayout(self)
             root.setSpacing(4)
-            root.setContentsMargins(6, 14, 6, 6)
+            root.setContentsMargins(6, 6, 6, 6)
 
-            # ── Top bar: BPM + Tap + Bypass ──
+            # ── Header: disclosure + summary + BPM + Tap + DSP + Bypass ──
             top = QtWidgets.QHBoxLayout()
             top.setSpacing(6)
+
+            self.collapse_btn = QtWidgets.QToolButton()
+            self.collapse_btn.setText("Effects")
+            self.collapse_btn.setArrowType(QtCore.Qt.RightArrow)
+            self.collapse_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+            self.collapse_btn.setAutoRaise(True)
+            self.collapse_btn.setStyleSheet(
+                "QToolButton { font-weight: bold; border: none; padding: 4px; }")
+            self.collapse_btn.setCursor(QtCore.Qt.PointingHandCursor)
+            self.collapse_btn.setToolTip("Click to show/hide the effects rack")
+            self.collapse_btn.clicked.connect(self._on_collapse)
+            top.addWidget(self.collapse_btn)
+
+            # Summary shown while collapsed, e.g. "2 active"
+            self.summary_lbl = QtWidgets.QLabel("")
+            self.summary_lbl.setStyleSheet("font-size: 11px; color: #888888;")
+            top.addWidget(self.summary_lbl)
+
+            top.addSpacing(10)
+
             bpm_lbl = QtWidgets.QLabel("BPM")
             bpm_lbl.setStyleSheet("font-weight: bold; font-size: 11px;")
             top.addWidget(bpm_lbl)
@@ -1631,6 +1782,14 @@ if QtWidgets is not None:
 
             top.addStretch()
 
+            # DSP load readout (% of the audio callback time budget)
+            self.dsp_lbl = QtWidgets.QLabel("")
+            self.dsp_lbl.setToolTip(
+                "Effects DSP load — share of the audio buffer time spent "
+                "in effects processing. Keep below ~50%.")
+            self.dsp_lbl.setStyleSheet("font-size: 10px; color: #888888;")
+            top.addWidget(self.dsp_lbl)
+
             self.bypass_btn = QtWidgets.QPushButton("FX ON")
             self.bypass_btn.setCheckable(True)
             self.bypass_btn.setChecked(engine.enabled)
@@ -1642,28 +1801,96 @@ if QtWidgets is not None:
 
             root.addLayout(top)
 
-            # ── Effect slot strips ──
-            strips = QtWidgets.QHBoxLayout()
-            strips.setSpacing(4)
+            # ── Effect slot strips (collapsible body) ──
+            self._body = QtWidgets.QWidget()
+            strips = QtWidgets.QHBoxLayout(self._body)
+            strips.setSpacing(6)
+            strips.setContentsMargins(0, 0, 0, 0)
 
             self.track_slots = []
             for t in range(engine.num_tracks):
                 slot = EffectSlotWidget(engine, 0, t, is_bus=False)
+                slot.effect_changed.connect(self._update_summary)
                 self.track_slots.append(slot)
                 strips.addWidget(slot)
 
-            # Separator
-            sep = QtWidgets.QFrame()
-            sep.setFrameShape(QtWidgets.QFrame.VLine)
-            sep.setMaximumWidth(2)
-            strips.addWidget(sep)
-
             self.bus_slot = EffectSlotWidget(engine, 0, 0, is_bus=True)
+            self.bus_slot.effect_changed.connect(self._update_summary)
             strips.addWidget(self.bus_slot)
 
-            root.addLayout(strips)
+            root.addWidget(self._body)
 
             self._current_out = 0
+            self._dsp_timer = QtCore.QTimer(self)
+            self._dsp_timer.timeout.connect(self._update_dsp_label)
+            self._dsp_timer.start(500)
+
+            if self._embedded:
+                # The section tab is the header — no disclosure needed
+                self.collapse_btn.hide()
+                self.summary_lbl.hide()
+                self.set_collapsed(False)
+            else:
+                # Start collapsed; expands automatically when a preset or
+                # the last session restores active effects
+                self.set_collapsed(True)
+
+        # ── Collapse ──
+
+        def set_collapsed(self, collapsed):
+            if self._embedded:
+                collapsed = False
+            self._body.setVisible(not collapsed)
+            self.collapse_btn.setArrowType(
+                QtCore.Qt.RightArrow if collapsed else QtCore.Qt.DownArrow)
+            self._update_summary()
+
+        def is_collapsed(self):
+            return not self._body.isVisible()
+
+        def _on_collapse(self):
+            self.set_collapsed(not self.is_collapsed())
+
+        def active_count(self):
+            """Number of slots (all outputs) holding an effect."""
+            count = sum(1 for slots in self.engine._track_fx
+                        for fx in slots if fx)
+            return count + sum(1 for fx in self.engine._bus_fx if fx)
+
+        def _update_summary(self):
+            """Refresh the 'N active' hint shown next to the header."""
+            count = self.active_count()
+            if self.is_collapsed():
+                self.summary_lbl.setText(
+                    f"{count} active" if count else "click to add effects")
+            else:
+                self.summary_lbl.setText("")
+            self.rack_changed.emit()
+
+        def refresh_from_engine(self):
+            """Re-sync the whole rack after engine state was replaced
+            (preset load / session restore)."""
+            self.bpm_spin.blockSignals(True)
+            self.bpm_spin.setValue(self.engine.bpm)
+            self.bpm_spin.blockSignals(False)
+            self.bypass_btn.setChecked(self.engine.enabled)
+            self._style_bypass_btn()
+            self.set_output_index(self._current_out)
+            self.set_collapsed(not self.engine.has_any_effect())
+
+        def _update_dsp_label(self):
+            if not self.engine.enabled or not self.engine.has_any_effect():
+                self.dsp_lbl.setText("")
+                return
+            pct = self.engine.get_load_pct(self._current_out)
+            if pct >= 80:
+                color = "#E05555"
+            elif pct >= 50:
+                color = "#E6A23C"
+            else:
+                color = "#888888"
+            self.dsp_lbl.setStyleSheet(f"font-size: 10px; color: {color};")
+            self.dsp_lbl.setText(f"DSP {pct:.0f}%")
 
         def _on_bpm(self, val):
             self.engine.set_bpm(val)
@@ -1686,18 +1913,13 @@ if QtWidgets is not None:
         def _on_bypass(self, checked):
             self.engine.enabled = checked
             self._style_bypass_btn()
+            # Turning FX on reveals the rack — no hidden state
+            if checked and self.is_collapsed():
+                self.set_collapsed(False)
 
         def _style_bypass_btn(self):
-            if self.engine.enabled:
-                self.bypass_btn.setText("FX ON")
-                self.bypass_btn.setStyleSheet(
-                    "background-color: #2A7A3A; color: white; "
-                    "font-weight: bold; border-radius: 4px;")
-            else:
-                self.bypass_btn.setText("FX OFF")
-                self.bypass_btn.setStyleSheet(
-                    "background-color: #555; color: #aaa; "
-                    "font-weight: bold; border-radius: 4px;")
+            # Checked state styling comes from the theme QSS
+            self.bypass_btn.setText("FX ON" if self.engine.enabled else "FX OFF")
 
         def set_output_index(self, out_idx):
             """Switch which output's effects are shown."""
