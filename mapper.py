@@ -329,6 +329,7 @@ class AudioManager:
             self._stopping = False
             self._stop_gains = [1.0] * num_outputs  # stop fade-out state
             self._diag_stale_reads = 0
+            self._diag_out_peaks = [0.0] * num_outputs  # per-output send peak
             self._diag_input_peaks = [0.0] * num_inputs  # per-input peak tracking
 
             # Open diagnostics log file (only when DEBUG enabled)
@@ -725,6 +726,12 @@ class AudioManager:
                                 output_frames = output_frames * ramp
                                 self._stop_gains[out_idx] = next_g
 
+                        # Per-output send peak (what actually leaves the app
+                        # toward this device — visible in audio_diag.log)
+                        _opk = float(np.abs(output_frames).max())
+                        if _opk > self._diag_out_peaks[out_idx]:
+                            self._diag_out_peaks[out_idx] = _opk
+
                         # Save for fade-out on future underrun
                         self._prev_outputs[out_idx] = output_frames.copy()
 
@@ -770,6 +777,10 @@ class AudioManager:
                                     f"{chr(ord('A')+i)}={p:.4f}"
                                     for i, p in enumerate(self._diag_input_peaks)
                                 )
+                                out_peak_str = " ".join(
+                                    f"{chr(ord('A')+i)}={p:.4f}"
+                                    for i, p in enumerate(self._diag_out_peaks)
+                                )
                                 self._diag_file.write(
                                     f"[{now:.1f}] callbacks={cbs} ({cb_rate:.0f}/s) | "
                                     f"underruns={self._diag_underruns} overruns={self._diag_overruns} | "
@@ -779,6 +790,7 @@ class AudioManager:
                                     f"max_cb={self._diag_cb_max_ms:.2f}ms | "
                                     f"out_peak={self._diag_peak:.4f} | "
                                     f"in_peaks: {input_peak_str} | "
+                                    f"out_sends: {out_peak_str} | "
                                     f"exceptions={self._diag_exceptions}\n"
                                 )
                                 self._diag_file.flush()
@@ -794,6 +806,7 @@ class AudioManager:
                                 self._diag_frame_mismatch = 0
                                 self._diag_exceptions = 0
                                 self._diag_input_peaks = [0.0] * len(self._diag_input_peaks)
+                                self._diag_out_peaks = [0.0] * len(self._diag_out_peaks)
 
                         return result
 
