@@ -70,6 +70,29 @@ def short_device_name(name, max_len=16):
         short = short[:max_len - 1].rstrip() + '…'
     return short
 
+
+def apply_alignment_delay(output_frames, tails, delay_samples):
+    """Delay individual output channels using per-channel history tails.
+
+    Used to line up a dry track with an external FX return (e.g. delay the
+    dry mic so it sits on top of the Analog Heat's USB round-trip).
+
+    output_frames: (frames, channels) float32 — modified in place and returned
+    tails: (channels, max_delay) float32 history, updated in place
+    delay_samples: per-channel delay in samples (0 = pass through)
+    """
+    n = len(output_frames)
+    max_d = tails.shape[1]
+    for ch in range(min(output_frames.shape[1], tails.shape[0])):
+        col = output_frames[:, ch]
+        combined = np.concatenate((tails[ch], col))
+        d = delay_samples[ch] if ch < len(delay_samples) else 0
+        if d > 0:
+            d = min(int(d), max_d)
+            output_frames[:, ch] = combined[max_d - d : max_d - d + n]
+        tails[ch] = combined[-max_d:]
+    return output_frames
+
 # First try PySide2, then try PyQt5 as fallback
 try:
     from PySide2 import QtCore, QtWidgets, QtGui
@@ -95,6 +118,9 @@ class AudioManager:
     # 48kHz/1024). Closing streams mid-signal is what causes stop noise.
     STOP_FADE_BUFFERS = 4
 
+    # Max per-track alignment delay (dry/wet round-trip compensation)
+    MAX_ALIGN_MS = 200
+
     def __init__(self):
         self.pa = pyaudio.PyAudio()
         self.input_streams = []  # List of input streams (up to 3 devices)
@@ -113,7 +139,11 @@ class AudioManager:
         self.total_input_channels = 2  # Total channels across all input devices
         self.num_output_channels = 8  # Default (for backward compat / viz)
         self.output_channel_counts = []  # Per-output channel counts
-        self.viz_output_idx = 0  # Which output drives visualization
+        self.viz_output_idx = 0  # Which output drives visualization (UI-selectable)
+        self.channel_levels_all = [[0.0] * 8 for _ in range(3)]  # per-output levels
+        # Per-output, per-track alignment delay in ms (UI writes, callback reads)
+        self.track_delay_ms = [[0] * 4 for _ in range(3)]
+        self._delay_tails = []  # per-output (channels, max_delay) history
 
         self._aggregate_device_ids = []  # CoreAudio aggregates (macOS only)
         self.sample_players = [None, None, None]  # Virtual inputs (one per slot)
@@ -150,6 +180,12 @@ class AudioManager:
             default_mapping.append([{'index': i % self.total_input_channels, 'gain': 1.0}])
         self.track_mappings = [default_mapping]
         
+    def set_track_delay(self, out_idx, track_idx, ms):
+        """Set a track's alignment delay (applied live by the callback)."""
+        if 0 <= out_idx < len(self.track_delay_ms) and 0 <= track_idx < 4:
+            self.track_delay_ms[out_idx][track_idx] = max(
+                0, min(self.MAX_ALIGN_MS, int(ms)))
+
     def update_default_mapping(self, total_input_channels):
         """Update the default mapping based on total available input channels across all devices"""
         if total_input_channels <= 0:
@@ -330,6 +366,14 @@ class AudioManager:
             self._stop_gains = [1.0] * num_outputs  # stop fade-out state
             self._diag_stale_reads = 0
             self._diag_out_peaks = [0.0] * num_outputs  # per-output send peak
+
+            # Alignment-delay history buffers (always allocated so delays
+            # can be changed live without reallocation in the callback)
+            _max_align_samples = int(self.MAX_ALIGN_MS / 1000.0 * rate)
+            self._delay_tails = [
+                np.zeros((odev['channels'], _max_align_samples), dtype=np.float32)
+                for odev in output_devices
+            ]
             self._diag_input_peaks = [0.0] * num_inputs  # per-input peak tracking
 
             # Open diagnostics log file (only when DEBUG enabled)
@@ -694,6 +738,17 @@ class AudioManager:
                                     mixed /= len(valid_entries)
                                 output_frames[:, out_ch] = mixed
 
+                        # Per-track alignment delay (delay the dry track to
+                        # line up with an external FX return). Tails update
+                        # every block so delay changes apply live.
+                        if out_idx < len(self._delay_tails):
+                            _dlys = self.track_delay_ms[out_idx]
+                            _ds = [int(_dlys[ch // 2] * rate / 1000.0)
+                                   if (ch // 2) < len(_dlys) else 0
+                                   for ch in range(out_channels)]
+                            output_frames = apply_alignment_delay(
+                                output_frames, self._delay_tails[out_idx], _ds)
+
                         # Apply effects (between mapping and soft-clip)
                         if self.effects_engine and self.effects_engine.enabled:
                             try:
@@ -735,16 +790,22 @@ class AudioManager:
                         # Save for fade-out on future underrun
                         self._prev_outputs[out_idx] = output_frames.copy()
 
-                        # Update visualization only from the viz output
+                        # Every output records its own channel levels so the
+                        # UI can monitor any output, not just output 0
+                        if out_idx < len(self.channel_levels_all):
+                            self.channel_levels_all[out_idx] = [
+                                np.abs(output_frames[:, ch]).mean() if ch < out_channels else 0.0
+                                for ch in range(8)
+                            ]
+
+                        # Spectrogram data + legacy channel_levels follow the
+                        # UI-selected monitor output (viz_output_idx)
                         if out_idx == self.viz_output_idx:
                             peak = float(np.abs(output_frames).max())
                             if peak > self._diag_peak:
                                 self._diag_peak = peak
 
-                            self.channel_levels = [
-                                np.abs(output_frames[:, ch]).mean() if ch < out_channels else 0.0
-                                for ch in range(8)
-                            ]
+                            self.channel_levels = self.channel_levels_all[out_idx]
                             sample_count = min(self.buffer_size, len(output_frames))
                             for ch in range(min(8, out_channels)):
                                 if sample_count > 0:
@@ -965,6 +1026,7 @@ class AudioManager:
 
         # Clear visualization data after the callbacks are gone
         self.channel_levels = [0.0] * 8
+        self.channel_levels_all = [[0.0] * 8 for _ in range(3)]
         self.audio_data = np.zeros((self.buffer_size, 8), dtype=np.float32)
         self._stopping = False
 
@@ -978,7 +1040,9 @@ class AudioManager:
         dbg("Audio routing stopped")
 
     def get_channel_levels(self):
-        """Get levels for all channels"""
+        """Get levels for all channels of the monitored output."""
+        if 0 <= self.viz_output_idx < len(self.channel_levels_all):
+            return self.channel_levels_all[self.viz_output_idx]
         return self.channel_levels
     
     def get_audio_data(self, channel=0):
@@ -2200,7 +2264,7 @@ class EnhancedMultiLevelMeter(QtWidgets.QWidget):
     """Enhanced widget for visualizing multiple channel levels with animations and clipping detection"""
     def __init__(self, parent=None, channels=8):
         super().__init__(parent)
-        self.setMinimumSize(20 * channels, 200)
+        self.setMinimumSize(20 * channels, 80)
         self.levels = [0.0] * channels
         self.target_levels = [0.0] * channels  # Target for animation
         self.peak_levels = [0.0] * channels  # Peak hold values
@@ -2230,7 +2294,7 @@ class EnhancedMultiLevelMeter(QtWidgets.QWidget):
     def set_channels(self, num_channels):
         """Update the number of channels shown"""
         self.num_channels = min(num_channels, 8)  # Limit to 8 channels max
-        self.setMinimumSize(20 * self.num_channels, 200)
+        self.setMinimumSize(20 * self.num_channels, 80)
         self.update()
 
     def set_track_names(self, names):
@@ -2305,151 +2369,129 @@ class EnhancedMultiLevelMeter(QtWidgets.QWidget):
         if changed:
             self.update()
             
+    # ── Ableton-style flat metering ──────────────────────────────────
+    # dB-linear scale (not amplitude-linear): bars spend their range where
+    # the music lives. Hairline grid, flat zone colors, 1px peak hold.
+    DB_FLOOR = -60.0
+    GRID_DB = [0, -6, -12, -18, -24, -36, -48]
+    GUTTER_W = 26   # left gutter for dB labels
+    TOP_PAD = 18    # track name row
+    BOTTOM_PAD = 13  # L/R labels
+
+    @classmethod
+    def _db_norm(cls, amp):
+        """Linear amplitude → 0..1 position on the dB-linear scale."""
+        if amp <= 1e-6:
+            return 0.0
+        db = 20.0 * math.log10(amp)
+        return max(0.0, min(1.0, (db - cls.DB_FLOOR) / -cls.DB_FLOOR))
+
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
-        painter.setRenderHint(QtGui.QPainter.Antialiasing)
-        
         width = self.width()
         height = self.height()
-        meter_width = width // self.num_channels if self.num_channels > 0 else width
-        
-        # Draw background for all meters
+        bar_top = self.TOP_PAD
+        bar_h = height - self.TOP_PAD - self.BOTTOM_PAD
+        if bar_h <= 0 or self.num_channels <= 0:
+            return
+        meter_w = (width - self.GUTTER_W) / self.num_channels
+
+        # Flat background
         painter.fillRect(0, 0, width, height, self._meter_outer_bg)
 
-        # Draw each channel meter
+        # Hairline dB gridlines + labels in the left gutter
+        grid_pen = QtGui.QPen(QtGui.QColor(255, 255, 255, 18), 1)
+        label_color = QtGui.QColor(150, 150, 155, 140)
+        painter.setFont(QtGui.QFont("Arial", 7))
+        for db in self.GRID_DB:
+            yn = (db - self.DB_FLOOR) / -self.DB_FLOOR
+            y = int(bar_top + bar_h * (1.0 - yn))
+            painter.setPen(grid_pen)
+            painter.drawLine(self.GUTTER_W, y, width, y)
+            # Label every other line — keeps the gutter readable at small sizes
+            if db in (0, -12, -24, -36, -48):
+                painter.setPen(label_color)
+                painter.drawText(QtCore.QRectF(0, y - 6, self.GUTTER_W - 4, 12),
+                                 QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter,
+                                 str(db))
+
+        # Per-channel bars
         for ch in range(self.num_channels):
-            level = self.levels[ch]
-            peak_level = self.peak_levels[ch]
-            level_height = int(height * level)
-            peak_height = int(height * peak_level)
-            x = ch * meter_width
+            cell_x = self.GUTTER_W + ch * meter_w
+            bar_w = max(4.0, meter_w * 0.5)
+            bx = cell_x + (meter_w - bar_w) / 2
 
-            # Draw meter gradient background
-            painter.fillRect(
-                x, 0, meter_width - 1, height,
-                self._meter_bg
-            )
+            # Bar slot (slightly darker than the panel)
+            painter.fillRect(QtCore.QRectF(bx, bar_top, bar_w, bar_h),
+                             self._meter_bg)
 
-            # Track/channel identifier at bottom
-            track_num = ch // 2 + 1
-            ch_num = ch % 2 + 1
-
-            # Draw rounded meter with zone-driven gradient
-            if level_height > 0:
-                gradient = QtGui.QLinearGradient(
-                    x, height - level_height,
-                    x, height
-                )
-
-                # Pick colors from self.meter_zones
-                top_rgb = self.meter_zones[-1][1]
-                bot_rgb = self.meter_zones[-1][2]
-                for threshold, t_rgb, b_rgb in self.meter_zones:
-                    if level < threshold:
-                        top_rgb, bot_rgb = t_rgb, b_rgb
+            # Level fill — flat, segmented by zone thresholds
+            level_n = self._db_norm(self.levels[ch])
+            if level_n > 0:
+                prev_n = 0.0
+                for threshold, top_rgb, _bot in self.meter_zones:
+                    zone_n = self._db_norm(min(threshold, 1.0)) if threshold <= 1.0 else 1.0
+                    seg_top = min(level_n, zone_n)
+                    if seg_top > prev_n:
+                        y0 = bar_top + bar_h * (1.0 - seg_top)
+                        y1 = bar_top + bar_h * (1.0 - prev_n)
+                        painter.fillRect(QtCore.QRectF(bx, y0, bar_w, y1 - y0),
+                                         QtGui.QColor(*top_rgb))
+                    if level_n <= zone_n:
                         break
-                gradient.setColorAt(0, QtGui.QColor(*top_rgb))
-                gradient.setColorAt(1, QtGui.QColor(*bot_rgb))
+                    prev_n = zone_n
 
-                # Fill rounded meter
-                meter_rect = QtCore.QRectF(
-                    x + 1, height - level_height,
-                    meter_width - 2, level_height
-                )
-                painter.setBrush(gradient)
-                painter.setPen(QtCore.Qt.NoPen)
-                painter.drawRoundedRect(meter_rect, 2, 2)
-
-            # Draw peak indicator with zone-driven colors
-            if peak_height > 0:
+            # Peak hold — 1px line, zone-colored
+            peak = self.peak_levels[ch]
+            if peak > 0:
                 peak_rgb = self.meter_peak_zones[-1][1]
                 for threshold, p_rgb in self.meter_peak_zones:
-                    if peak_level < threshold:
+                    if peak < threshold:
                         peak_rgb = p_rgb
                         break
+                py = bar_top + bar_h * (1.0 - self._db_norm(peak))
+                painter.fillRect(QtCore.QRectF(bx, py, bar_w, 1.5),
+                                 QtGui.QColor(*peak_rgb))
 
-                # Clip blink override
-                if peak_level >= 0.95 and self.clip_indicators[ch] > 0:
-                    frame = self.clip_indicators[ch]
-                    if frame % 10 >= 5:
-                        peak_rgb = (min(255, peak_rgb[0]), min(255, peak_rgb[1] + 170), min(255, peak_rgb[2] + 170))
-
-                peak_color = QtGui.QColor(*peak_rgb)
-                
-                peak_rect = QtCore.QRectF(
-                    x + 1, height - peak_height - 2, 
-                    meter_width - 2, 3  # Slightly thicker peak indicator
-                )
-                
-                # Draw with slight glow effect
-                if peak_level > 0.7:  # Add glow to higher peaks
-                    glow_rect = QtCore.QRectF(
-                        x + 1, height - peak_height - 3, 
-                        meter_width - 2, 5
-                    )
-                    glow_color = QtGui.QColor(peak_color)
-                    glow_color.setAlpha(100)
-                    painter.setBrush(glow_color)
-                    painter.drawRoundedRect(glow_rect, 2, 2)
-                
-                painter.fillRect(peak_rect, peak_color)
-            
-            # Draw simplified tick marks/grid so the meter looks cleaner
-            grid_color = QtGui.QColor(75, 75, 80, 150)
-            painter.setPen(grid_color)
-            for db in self.tick_levels:
-                linear = 10 ** (db / 20)
-                if linear <= 0:
-                    continue
-                y = height - (linear * height)
-                tick_len = meter_width - 6 if db >= -12 else max(meter_width // 2, 8)
-                painter.drawLine(x + 3, int(y), x + 3 + tick_len, int(y))
-            
-            # Draw track/channel label 
-            painter.setPen(QtGui.QColor(180, 180, 180))
-            painter.setFont(QtGui.QFont("Arial", 8))
-            
-            # Format as Track.Channel
-            label = f"{track_num}.{ch_num}"
-            text_rect = QtCore.QRectF(x, height - 18, meter_width, 16)
-            painter.drawText(text_rect, QtCore.Qt.AlignCenter, label)
-            
-            # Draw clip indicator text at top of meter if clipping
+            # Clip — solid red block at the very top of the slot
             if self.clip_indicators[ch] > 0:
-                painter.setFont(QtGui.QFont("Arial", 7, QtGui.QFont.Bold))
-                
-                # Alternate colors for attention
-                if self.clip_indicators[ch] % 10 < 5:
-                    painter.setPen(QtGui.QColor(255, 50, 50))  # Red
-                else:
-                    painter.setPen(QtGui.QColor(255, 255, 255))  # White
-                
-                clip_rect = QtCore.QRectF(x, 25, meter_width, 16)
-                painter.drawText(clip_rect, QtCore.Qt.AlignCenter, "CLIP")
+                painter.fillRect(QtCore.QRectF(bx, bar_top, bar_w, 4),
+                                 QtGui.QColor(255, 50, 50))
 
-        # Track name row — drawn after all meters so a label spanning two
-        # meter cells isn't overdrawn by the next meter's background
-        painter.setFont(QtGui.QFont("Arial", 9, QtGui.QFont.Bold))
+            # L/R label under the bar
+            painter.setPen(QtGui.QColor(140, 140, 145, 160))
+            painter.setFont(QtGui.QFont("Arial", 7))
+            painter.drawText(
+                QtCore.QRectF(cell_x, height - self.BOTTOM_PAD, meter_w, self.BOTTOM_PAD),
+                QtCore.Qt.AlignCenter, "L" if ch % 2 == 0 else "R")
+
+        # Track-pair separators (hairline)
+        sep_pen = QtGui.QPen(QtGui.QColor(255, 255, 255, 22), 1)
+        painter.setPen(sep_pen)
+        for t in range(1, (self.num_channels + 1) // 2):
+            x = int(self.GUTTER_W + t * 2 * meter_w)
+            painter.drawLine(x, bar_top, x, bar_top + bar_h)
+
+        # Track name row
+        painter.setFont(QtGui.QFont("Arial", 8, QtGui.QFont.Bold))
         for ch in range(0, self.num_channels, 2):
-            x = ch * meter_width
+            x = self.GUTTER_W + ch * meter_w
             track_num = ch // 2 + 1
             track_activity = (max(self.levels[ch], self.levels[ch + 1])
                               if ch + 1 < self.num_channels else self.levels[ch])
             if track_activity > 0.95:
                 painter.setPen(QtGui.QColor(255, 100, 100))
-            elif track_activity > 0.85:
-                painter.setPen(QtGui.QColor(255, 180, 0))
             elif track_activity > 0.7:
-                painter.setPen(QtGui.QColor(220, 220, 0))
+                painter.setPen(QtGui.QColor(255, 180, 0))
             else:
-                painter.setPen(QtGui.QColor(150, 150, 150))
+                painter.setPen(QtGui.QColor(160, 160, 165))
             if self.track_names and track_num - 1 < len(self.track_names):
                 name = self.track_names[track_num - 1]
                 if len(name) > 10:
                     name = name[:9] + '…'
             else:
                 name = f"Track {track_num}"
-            painter.drawText(QtCore.QRectF(x, 2, meter_width * 2, 16),
+            painter.drawText(QtCore.QRectF(x, 2, meter_w * 2, 14),
                              QtCore.Qt.AlignCenter, name)
 
 
@@ -3018,6 +3060,7 @@ class MixerStripView(QtWidgets.QWidget):
 
     mapping_changed = Signal()
     track_names_changed = Signal()
+    delay_changed = Signal(int, int)  # (track_idx, delay_ms)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3114,6 +3157,35 @@ class MixerStripView(QtWidgets.QWidget):
         input_combo.currentIndexChanged.connect(lambda: self.mapping_changed.emit())
         layout.addWidget(input_combo)
 
+        # Alignment delay — delays this track to line up with an external
+        # FX return (e.g. dry mic vs Analog Heat USB round trip)
+        align_label = QtWidgets.QLabel("Align")
+        align_label.setAlignment(QtCore.Qt.AlignCenter)
+        align_label.setStyleSheet("font-size: 10px;")
+        layout.addWidget(align_label)
+
+        align = MiniKnob()
+        align.setRange(0, 200)
+        align.setValue(0)
+        align.set_default_value(0)
+        align.set_accent_color(color)
+        align.setFixedSize(40, 40)
+        align.setToolTip("Delay this track 0–200 ms to line it up with a "
+                         "wet return\nDrag up/down — double-click to reset")
+        align_row = QtWidgets.QHBoxLayout()
+        align_row.addStretch()
+        align_row.addWidget(align)
+        align_row.addStretch()
+        layout.addLayout(align_row)
+
+        align_val = QtWidgets.QLabel("0 ms")
+        align_val.setAlignment(QtCore.Qt.AlignCenter)
+        align_val.setStyleSheet("font-size: 10px;")
+        layout.addWidget(align_val)
+        align.valueChanged.connect(lambda v, lbl=align_val: lbl.setText(f"{v} ms"))
+        align.valueChanged.connect(
+            lambda v, t=track_idx: self.delay_changed.emit(t, v))
+
         layout.addStretch()
 
         return {
@@ -3124,6 +3196,7 @@ class MixerStripView(QtWidgets.QWidget):
             'dial': dial,
             'vol_label': vol_label,
             'vol_val': vol_val,
+            'align': align,
             'input_combo': input_combo,
             'track_idx': track_idx,
         }
@@ -3299,6 +3372,15 @@ class MixerStripView(QtWidgets.QWidget):
     def get_track_color(self, track_idx):
         return self._track_colors[track_idx % len(self._track_colors)]
 
+    def get_track_delays(self):
+        """Per-track alignment delays in ms."""
+        return [strip['align'].value() for strip in self.strips]
+
+    def set_track_delays(self, delays):
+        """Restore alignment delays (emits delay_changed → engine update)."""
+        for strip, ms in zip(self.strips, delays or []):
+            strip['align'].setValue(int(ms))
+
     def get_track_names(self):
         """Current track names, e.g. ['Drums', 'Track 2', ...]."""
         return [strip['title'].text() for strip in self.strips]
@@ -3316,6 +3398,7 @@ class MixerStripView(QtWidgets.QWidget):
             color = self.get_track_color(i)
             strip['title'].setStyleSheet(self._title_style(color))
             strip['dial'].set_accent_color(color)
+            strip['align'].set_accent_color(color)
             if strip['on_btn'].isChecked():
                 strip['on_btn'].setStyleSheet(self._toggle_style(True, color))
 
@@ -3730,6 +3813,7 @@ class MainWindow(QtWidgets.QMainWindow):
         mapper_layout.addLayout(view_row)
 
         self._current_view = 'mixer'  # Mixer is the default view
+        self._viz_slot = 'A'  # which output the MONITORING panel follows
 
         # Patchbay view: per-output PatchbayView tabs
         self.mapper_tabs = QtWidgets.QTabWidget()
@@ -3749,6 +3833,8 @@ class MainWindow(QtWidgets.QMainWindow):
         mixer_a = MixerStripView()
         mixer_a.mapping_changed.connect(lambda: self.apply_mapping(0))
         mixer_a.track_names_changed.connect(lambda s='A': self._sync_track_names(s))
+        mixer_a.delay_changed.connect(
+            lambda t, ms, s='A': self._on_track_delay(s, t, ms))
         self.mixer_views['A'] = mixer_a
         self.mixer_tabs.addTab(mixer_a, "Output A")
 
@@ -3785,6 +3871,7 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Visualization area
         viz_group = QtWidgets.QGroupBox("MONITORING")
+        self._viz_group = viz_group
         viz_layout = QtWidgets.QVBoxLayout()
         
         # Create enhanced visualization widgets
@@ -3819,6 +3906,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._cached_output_devices = []
         self._updating_inputs = False  # Guard against re-entrant input_device_changed
 
+        # MONITORING follows whichever output tab is selected
+        self.mixer_tabs.currentChanged.connect(self._on_output_tab_changed)
+        self.mapper_tabs.currentChanged.connect(self._on_output_tab_changed)
+
         # Initialize
         self.refresh_devices()
     
@@ -3835,7 +3926,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Level meters strip at bottom
         self.level_meters = EnhancedMultiLevelMeter(channels=8)
-        self.level_meters.setMaximumHeight(120)
+        self.level_meters.setMinimumHeight(130)
+        self.level_meters.setMaximumHeight(170)
         viz_layout.addWidget(self.level_meters)
 
         # Track status labels — single row, evenly spaced
@@ -3983,6 +4075,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._view_mixer_btn.setChecked(False)
 
         self._current_view = mode
+        # The other view's tab set may be on a different output
+        self._on_output_tab_changed()
 
     def get_input_infos(self):
         """Get info for all enabled input devices.
@@ -4251,6 +4345,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     idx = tabs.indexOf(view)
                     if idx >= 0:
                         tabs.setTabText(idx, title)
+        self._update_monitor_label()
 
     def _sync_track_names(self, slot):
         """Propagate mixer track renames to the patchbay, meters, and status labels."""
@@ -4260,10 +4355,51 @@ class MainWindow(QtWidgets.QMainWindow):
         names = mixer.get_track_names()
         if slot in self.track_mappers:
             self.track_mappers[slot].set_track_names(names)
-        if slot == 'A' and hasattr(self, 'level_meters'):
+        if slot == self._viz_slot and hasattr(self, 'level_meters'):
             self.level_meters.set_track_names(names)
             # Force status labels to re-render with the new names
             self._track_label_states = [None] * len(self._track_label_states)
+
+    def _on_track_delay(self, slot, track_idx, ms):
+        """Push a strip's alignment delay into the audio engine (live-safe)."""
+        out_idx = {'A': 0, 'B': 1, 'C': 2}.get(slot, 0)
+        self.audio_manager.set_track_delay(out_idx, track_idx, ms)
+
+    def _on_output_tab_changed(self, _idx=None):
+        """MONITORING (meters + spectrogram) follows the selected output tab."""
+        if not hasattr(self, 'level_meters'):
+            return  # during construction
+        tabs = self.mixer_tabs if self._current_view == 'mixer' else self.mapper_tabs
+        views = self.mixer_views if self._current_view == 'mixer' else self.track_mappers
+        w = tabs.currentWidget()
+        slot = next((s for s, v in views.items() if v is w), 'A')
+        self._viz_slot = slot
+        self.audio_manager.viz_output_idx = {'A': 0, 'B': 1, 'C': 2}[slot]
+
+        # Meter channel count + track names for the monitored output
+        ch_combo = {'A': self.channels_combo_a, 'B': self.channels_combo_b,
+                    'C': self.channels_combo_c}.get(slot)
+        out_ch = (ch_combo.currentData() if ch_combo else None) or 2
+        self.level_meters.set_channels(out_ch)
+        self.update_track_labels(max(1, out_ch // 2))
+        mixer = self.mixer_views.get(slot)
+        if mixer:
+            self.level_meters.set_track_names(mixer.get_track_names())
+        self._track_label_states = [None] * len(self._track_label_states)
+        self._update_monitor_label()
+
+    def _update_monitor_label(self):
+        """MONITORING header shows which output is displayed."""
+        if not hasattr(self, '_viz_group'):
+            return
+        slot = self._viz_slot
+        dev_combo, _ = self._get_output_combos(slot)
+        dev_idx = dev_combo.currentData()
+        if dev_idx is not None and dev_idx in self.device_map:
+            name = self.device_display_name(self.device_map[dev_idx]['name'])
+            self._viz_group.setTitle(f"MONITORING — {slot} · {name.upper()}")
+        else:
+            self._viz_group.setTitle(f"MONITORING — OUT {slot}")
 
     def _update_effects_tab_label(self):
         """Show the active-effect count on the Effects tab ('Effects · 2')."""
@@ -4274,8 +4410,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._effects_tab_idx, f"Effects · {count}" if count else "Effects")
 
     def _track_display_name(self, i):
-        """Name shown in the per-track status labels (custom name from mixer A)."""
-        mixer = self.mixer_views.get('A')
+        """Name shown in the per-track status labels (monitored output's mixer)."""
+        mixer = self.mixer_views.get(self._viz_slot) or self.mixer_views.get('A')
         if mixer:
             names = mixer.get_track_names()
             if i < len(names) and names[i]:
@@ -4345,22 +4481,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._populate_output_combo(self.output_combo_b, add_placeholder=True)
         self._populate_output_combo(self.output_combo_c, add_placeholder=True)
 
-        # Auto-select S4 on Output A if found (match on real device name,
-        # not the displayed alias)
-        for dev in self._cached_output_devices:
-            if "S4" in dev['name'] or "S-4" in dev['name']:
-                idx = self.output_combo_a.findData(dev['index'])
-                if idx >= 0:
-                    self.output_combo_a.setCurrentIndex(idx)
-                break
-
-        # Auto-select Digitakt on Input A if found
-        for dev in self._cached_input_devices:
-            if "Digitakt" in dev['name']:
-                idx = self.input_combo_a.findData(dev['index'])
-                if idx >= 0:
-                    self.input_combo_a.setCurrentIndex(idx)
-                break
+        # No hardcoded device preferences — first device is the default;
+        # returning users get their selection back via last-session restore
 
         # Update channel combos for initially selected outputs
         self.output_device_changed('A')
@@ -4439,6 +4561,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 mixer = MixerStripView()
                 mixer.mapping_changed.connect(lambda oi=out_idx: self.apply_mapping(oi))
                 mixer.track_names_changed.connect(lambda s=slot: self._sync_track_names(s))
+                mixer.delay_changed.connect(
+                    lambda t, ms, s=slot: self._on_track_delay(s, t, ms))
                 self.mixer_views[slot] = mixer
                 self.mixer_tabs.addTab(mixer, f"Output {slot}")
                 # Initialize with current input info and auto-assign
@@ -4558,11 +4682,8 @@ class MainWindow(QtWidgets.QMainWindow):
                               self.sample_rate_combo]:
                     combo.setEnabled(False)
 
-                # Update UI elements for the primary output's channel/track count
-                output_channels = output_devices[0]['channels']
-                tracks = output_channels // 2
-                self.level_meters.set_channels(output_channels)
-                self.update_track_labels(tracks)
+                # Sync MONITORING to whichever output tab is selected
+                self._on_output_tab_changed()
 
                 # Build status message
                 input_infos = self.get_input_infos()
@@ -4806,6 +4927,11 @@ class MainWindow(QtWidgets.QMainWindow):
             slot: mixer.get_track_names()
             for slot, mixer in self.mixer_views.items()
         }
+        # Per-track alignment delays
+        config['track_delays'] = {
+            slot: mixer.get_track_delays()
+            for slot, mixer in self.mixer_views.items()
+        }
         # Effects rack state (bpm, bypass, every slot's effect + params)
         if self.audio_manager.effects_engine:
             config['effects'] = self.audio_manager.effects_engine.get_state()
@@ -4901,6 +5027,12 @@ class MainWindow(QtWidgets.QMainWindow):
             mixer = self.mixer_views.get(slot)
             if mixer and names:
                 mixer.set_track_names(names)
+
+        # Restore alignment delays (emits delay_changed → engine update)
+        for slot, delays in (config.get('track_delays') or {}).items():
+            mixer = self.mixer_views.get(slot)
+            if mixer and delays:
+                mixer.set_track_delays(delays)
 
         # Restore effects rack state and re-sync its UI
         fx_state = config.get('effects')
@@ -5056,7 +5188,13 @@ class MainWindow(QtWidgets.QMainWindow):
 def main():
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle('Fusion')  # Use Fusion style for consistent look
-    
+
+    # App/Dock icon (black square, white LF — assets/icon.png)
+    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             'assets', 'icon.png')
+    if os.path.isfile(icon_path):
+        app.setWindowIcon(QtGui.QIcon(icon_path))
+
     # Apply the default Dark theme via themes.py
     app.setStyleSheet(generate_qss(THEMES['Dark']['palette']))
     
